@@ -1,0 +1,28 @@
+# Virtual environment
+.venv/
+
+# Paper wallet state (personal trading history + capital)
+paper_wallet.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environment / secrets (for when you add live API keys later)
+.env
+.env.*
+secrets.py
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Editor
+.vscode/
+.idea/
