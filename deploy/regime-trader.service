@@ -19,8 +19,8 @@
 #   sudo systemctl status regime-trader     # check if running
 #   sudo systemctl stop regime-trader       # graceful stop
 #   sudo journalctl -u regime-trader -f     # live service logs
-#   tail -f /path/to/bot/bot.log            # application logs
-#   tail -f /path/to/bot/stdout.log         # console output
+#   tail -f /home/ubuntu/hyperliquid-bot/bot.log     # application logs
+#   tail -f /home/ubuntu/hyperliquid-bot/stdout.log  # console output
 # ============================================================
 
 [Unit]
@@ -35,18 +35,18 @@ Type=simple
 User=ubuntu
 
 # EDIT: absolute path to the bot directory on the server
-WorkingDirectory=/home/ubuntu/technicals-bot
+WorkingDirectory=/home/ubuntu/hyperliquid-bot
 
 # EDIT: absolute path to the Python binary inside your venv
-ExecStart=/home/ubuntu/technicals-bot/.venv/bin/python regime_trade.py
+ExecStart=/home/ubuntu/hyperliquid-bot/.venv/bin/python regime_trade.py
 
 # Auto-restart on crash; wait 30s before retrying to avoid tight loops
 Restart=on-failure
 RestartSec=30
 
 # Redirect console output (Rich) to a separate file alongside bot.log
-StandardOutput=append:/home/ubuntu/technicals-bot/stdout.log
-StandardError=append:/home/ubuntu/technicals-bot/stderr.log
+StandardOutput=append:/home/ubuntu/hyperliquid-bot/stdout.log
+StandardError=append:/home/ubuntu/hyperliquid-bot/stderr.log
 
 # Give the process time to shut down cleanly on SIGINT before force-killing
 TimeoutStopSec=15

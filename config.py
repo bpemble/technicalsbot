@@ -75,11 +75,12 @@ FUNDING_PENALTY_MAX = 20.0     # max score points deducted (out of 100)
 PAPER_CAPITAL    = 10_000.0    # starting paper capital (USDC)
 REGIME_STATE_FILE = "wallet_regime.json"   # persisted wallet state for regime trader
 SWING_STATE_FILE  = "wallet_swing.json"    # persisted wallet state for swing/scalp trader
-POLL_INTERVAL_SEC = 900        # seconds between full regime scans (15 min = 1 × 15m candle)
-FAST_POLL_SEC     = 60         # seconds between lightweight hard-stop checks
+POLL_INTERVAL_SEC = 60         # seconds between full regime scans
+FAST_POLL_SEC     = 15         # seconds between lightweight hard-stop checks
 
 # --------------- Logging -------------------------------------
-LOG_FILE = "bot.log"
+LOG_FILE    = "bot.log"
+SCORES_FILE = "scores.json"   # latest regime scores written each scan
 
 # --------------- Multi-asset portfolio -----------------------
 MAX_POSITIONS = 10          # max simultaneous open positions

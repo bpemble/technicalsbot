@@ -22,6 +22,9 @@ secrets.py
 # macOS
 .DS_Store
 
+# Runtime data (changes every scan, not source)
+scores.json
+
 # Logs
 *.log
 logs/

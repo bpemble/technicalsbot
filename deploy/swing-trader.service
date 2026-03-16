@@ -8,12 +8,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ubuntu                                                      # EDIT
-WorkingDirectory=/home/ubuntu/technicals-bot                     # EDIT
-ExecStart=/home/ubuntu/technicals-bot/.venv/bin/python paper_trade.py  # EDIT venv path
+WorkingDirectory=/home/ubuntu/hyperliquid-bot
+ExecStart=/home/ubuntu/hyperliquid-bot/.venv/bin/python paper_trade.py
 Restart=on-failure
 RestartSec=30
-StandardOutput=append:/home/ubuntu/technicals-bot/stdout-swing.log
-StandardError=append:/home/ubuntu/technicals-bot/stderr-swing.log
+StandardOutput=append:/home/ubuntu/hyperliquid-bot/stdout-swing.log
+StandardError=append:/home/ubuntu/hyperliquid-bot/stderr-swing.log
 TimeoutStopSec=15
 
 [Install]

@@ -27,7 +27,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich import box
 
 import config
-from data.fetcher import fetch_ohlcv, fetch_funding_rates, fetch_latest_prices
+from data.fetcher import fetch_funding_rates, fetch_latest_prices, DataCache
 from indicators.compute import add_indicators
 from strategy.regime import RegimeEngine
 from live.paper_wallet import PaperWallet
@@ -85,15 +85,15 @@ signal.signal(signal.SIGINT, _handle_sigint)
 # Data
 # ------------------------------------------------------------------
 
-def fetch_asset(asset: dict) -> dict | None:
-    """Fetch all 4 timeframes for one asset. Returns None on any failure."""
+def fetch_asset(asset: dict, cache: DataCache) -> dict | None:
+    """Return all 4 timeframes for one asset from the cache."""
     try:
-        symbol = asset["kraken"]
+        coin = asset["hl"]
         return {
-            "1d":  fetch_ohlcv(symbol, "1d",  config.LOOKBACK_DAYS),
-            "4h":  fetch_ohlcv(symbol, "4h",  config.LOOKBACK_DAYS),
-            "1h":  fetch_ohlcv(symbol, "1h",  7),
-            "15m": fetch_ohlcv(symbol, "15m", config.SCALP_LOOKBACK_DAYS),
+            "1d":  cache.get(coin, "1d",  config.LOOKBACK_DAYS),
+            "4h":  cache.get(coin, "4h",  config.LOOKBACK_DAYS),
+            "1h":  cache.get(coin, "1h",  7),
+            "15m": cache.get(coin, "15m", config.SCALP_LOOKBACK_DAYS),
         }
     except Exception:
         return None
@@ -103,7 +103,7 @@ def fetch_asset(asset: dict) -> dict | None:
 # Regime computation across all assets
 # ------------------------------------------------------------------
 
-def compute_all_regimes(engine: RegimeEngine, funding_rates: dict | None = None) -> list[dict]:
+def compute_all_regimes(engine: RegimeEngine, cache: DataCache, funding_rates: dict | None = None) -> list[dict]:
     """
     Loop over all config.ASSETS in parallel, fetch data, compute regime snapshot.
 
@@ -118,7 +118,7 @@ def compute_all_regimes(engine: RegimeEngine, funding_rates: dict | None = None)
 
     def process_asset(asset):
         name = asset["name"]
-        frames = fetch_asset(asset)
+        frames = fetch_asset(asset, cache)
         if frames is None:
             return name, None
         try:
@@ -553,6 +553,32 @@ def print_portfolio(regimes: list[dict], wallet: PaperWallet):
 # Main loop
 # ------------------------------------------------------------------
 
+def _save_scores(regimes: list[dict], tick: int):
+    """Persist latest regime scores to scores.json for the dashboard."""
+    import json, os
+    data = {
+        "tick":          tick,
+        "timestamp":     fmt_now(),
+        "timestamp_iso": datetime.now(tz=timezone.utc).isoformat(),
+        "assets": [
+            {
+                "name":         r["asset"]["name"],
+                "tier":         r["asset"]["tier"],
+                "price":        r["price"],
+                "score":        round(r["adj_score"], 2),
+                "direction":    _direction_from_score(r["adj_score"]),
+                "conviction":   round(abs(r["adj_score"]) / 100, 4),
+                "funding_rate": round(r.get("funding_rate", 0.0), 6),
+            }
+            for r in regimes
+        ],
+    }
+    tmp = config.SCORES_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, config.SCORES_FILE)
+
+
 def run():
     console.print()
     console.print(Panel(
@@ -571,12 +597,24 @@ def run():
 
     wallet = PaperWallet(config.REGIME_STATE_FILE, config.PAPER_CAPITAL)
     engine = RegimeEngine(config)
+    cache  = DataCache()
 
     console.print(
         f"  Wallet loaded — cash: [bold]${wallet.capital:,.2f}[/bold]  "
         f"closed trades: [bold]{len(wallet.trades)}[/bold]  "
         f"open positions: [bold]{len(wallet.positions)}[/bold]"
     )
+    console.print()
+
+    # ---- Warm cache (full history fetch, done once at startup) -----------
+    console.print("  [dim]Warming data cache — fetching full history from Hyperliquid...[/dim]")
+    cache.warm(config.ASSETS, {
+        "1d":  config.LOOKBACK_DAYS,
+        "4h":  config.LOOKBACK_DAYS,
+        "1h":  7,
+        "15m": config.SCALP_LOOKBACK_DAYS,
+    })
+    console.print("  [green]Cache warmed.[/green]")
     console.print()
 
     tick    = 0
@@ -588,9 +626,9 @@ def run():
         console.rule(f"[dim]Tick {tick}  —  {fmt_now()}[/dim]")
         console.print()
 
-        console.print("  [dim]Fetching data and funding rates...[/dim]")
+        console.print("  [dim]Refreshing data and funding rates...[/dim]")
         funding_rates = fetch_funding_rates()
-        regimes = compute_all_regimes(engine, funding_rates)
+        regimes = compute_all_regimes(engine, cache, funding_rates)
 
         if not regimes:
             console.print("  [red]No asset data available this tick — skipping.[/red]")
@@ -599,6 +637,7 @@ def run():
             check_hard_stops(wallet, price_lookup)
             rebalance_portfolio(wallet, regimes)
             print_portfolio(regimes, wallet)
+            _save_scores(regimes, tick)
 
         if not _running:
             break

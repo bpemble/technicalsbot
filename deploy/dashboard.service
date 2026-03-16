@@ -1,0 +1,17 @@
+[Unit]
+Description=Ethereal Capital — Hyperliquid Bot Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/hyperliquid-bot
+ExecStart=/home/ubuntu/hyperliquid-bot/.venv/bin/uvicorn dashboard:app --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/ubuntu/hyperliquid-bot/stdout-dashboard.log
+StandardError=append:/home/ubuntu/hyperliquid-bot/stderr-dashboard.log
+
+[Install]
+WantedBy=multi-user.target
