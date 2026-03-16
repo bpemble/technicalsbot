@@ -47,11 +47,10 @@ class MultiTFStrategy:
         its close.
 
         Returns a DataFrame indexed by 4h timestamps with columns:
-            signal        : int  (1=long, -1=short, 0=none)
-            stop_loss     : float
-            take_profit   : float
-            position_size : float (ETH, indicative — engine recomputes live)
-            atr_at_signal : float
+            signal         : int  (1=long, -1=short, 0=none)
+            stop_loss      : float
+            take_profit    : float
+            atr_at_signal  : float
             close_at_signal: float
         """
         cfg = self.config
@@ -114,11 +113,10 @@ class MultiTFStrategy:
         close = merged["close"]
 
         out = pd.DataFrame(index=merged.index)
-        out["signal"]         = 0
-        out["stop_loss"]      = np.nan
-        out["take_profit"]    = np.nan
-        out["position_size"]  = np.nan
-        out["atr_at_signal"]  = atr
+        out["signal"]          = 0
+        out["stop_loss"]       = np.nan
+        out["take_profit"]     = np.nan
+        out["atr_at_signal"]   = atr
         out["close_at_signal"] = close
 
         out.loc[long_cond,  "signal"] =  1
@@ -132,12 +130,5 @@ class MultiTFStrategy:
         out.loc[short_mask, "stop_loss"]   = close[short_mask] + atr[short_mask] * cfg.ATR_STOP_MULTIPLIER
         out.loc[short_mask, "take_profit"] = close[short_mask] - atr[short_mask] * cfg.ATR_TP_MULTIPLIER
 
-        # Indicative position sizes (engine overrides with live capital)
-        stop_dist   = atr * cfg.ATR_STOP_MULTIPLIER
-        dollar_risk = cfg.INITIAL_CAPITAL * cfg.RISK_PER_TRADE
-        raw_size    = dollar_risk / stop_dist.replace(0, np.nan)
-        max_size    = (cfg.INITIAL_CAPITAL * cfg.LEVERAGE) / close.replace(0, np.nan)
-        sig_mask    = long_mask | short_mask
-        out.loc[sig_mask, "position_size"] = raw_size[sig_mask].clip(upper=max_size[sig_mask])
-
+        # signals generated: {n_long} long, {n_short} short
         return out

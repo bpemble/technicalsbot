@@ -20,6 +20,7 @@ from rich.text import Text
 from rich import box
 
 import config
+from utils import fmt_ts
 from data.fetcher import fetch_ohlcv
 from indicators.compute import add_indicators
 from strategy.multi_tf import MultiTFStrategy
@@ -34,19 +35,6 @@ console = Console()
 # Helpers
 # ================================================================
 
-def _color_value(value: float, positive_good: bool = True) -> str:
-    """Return a rich markup string coloured green/red based on sign."""
-    if positive_good:
-        color = "green" if value >= 0 else "red"
-    else:
-        color = "red" if value >= 0 else "green"
-    return f"[{color}]{value}[/{color}]"
-
-
-def _fmt(value, fmt_spec: str = ".2f", suffix: str = "") -> str:
-    return f"{value:{fmt_spec}}{suffix}"
-
-
 def draw_equity_curve(equity_curve: pd.Series, width: int = 70, height: int = 14) -> None:
     """
     Draw a simple ASCII equity curve in the terminal using rich markup.
@@ -57,7 +45,7 @@ def draw_equity_curve(equity_curve: pd.Series, width: int = 70, height: int = 14
         console.print("[yellow]No equity data to plot.[/yellow]")
         return
 
-    values = equity_curve.resample("1D").last().dropna().values.astype(float)
+    values = equity_curve.resample("D").last().dropna().values.astype(float)
     if len(values) < 2:
         console.print("[yellow]Not enough equity data points to plot.[/yellow]")
         return
@@ -145,6 +133,9 @@ def print_metrics_table(metrics: dict) -> None:
     sortino   = metrics["sortino_ratio"]
     pf        = metrics["profit_factor"]
 
+    # Handle infinite profit factor
+    pf_str = "∞" if pf == float("inf") else f"{pf:.3f}"
+
     row("Initial Capital",       f"[bold]${cap_init:,.2f}[/bold]")
     row("Final Capital",         f"[bold {'green' if cap_final >= cap_init else 'red'}]${cap_final:,.2f}[/bold {'green' if cap_final >= cap_init else 'red'}]")
     table.add_section()
@@ -154,7 +145,7 @@ def print_metrics_table(metrics: dict) -> None:
     table.add_section()
     row("Sharpe Ratio",          f"[{'green' if sharpe >= 1 else 'yellow' if sharpe >= 0 else 'red'}]{sharpe:.3f}[/{'green' if sharpe >= 1 else 'yellow' if sharpe >= 0 else 'red'}]")
     row("Sortino Ratio",         f"[{'green' if sortino >= 1 else 'yellow' if sortino >= 0 else 'red'}]{sortino:.3f}[/{'green' if sortino >= 1 else 'yellow' if sortino >= 0 else 'red'}]")
-    row("Profit Factor",         f"[{'green' if pf >= 1 else 'red'}]{pf:.3f}[/{'green' if pf >= 1 else 'red'}]")
+    row("Profit Factor",         f"[{'green' if pf == float('inf') or pf >= 1 else 'red'}]{pf_str}[/{'green' if pf == float('inf') or pf >= 1 else 'red'}]")
     table.add_section()
     row("Total Trades",          str(metrics["total_trades"]))
     row("Winning Trades",        f"[green]{metrics['winning_trades']}[/green]")
@@ -216,14 +207,8 @@ def print_recent_trades(trades: list, n: int = 20) -> None:
         color       = "green" if pnl >= 0 else "red"
         dir_markup  = "[cyan]LONG[/cyan]" if direction == "long" else "[magenta]SHORT[/magenta]"
 
-        entry_str = (
-            pd.Timestamp(t["entry_time"]).strftime("%Y-%m-%d %H:%M")
-            if t["entry_time"] else "—"
-        )
-        exit_str = (
-            pd.Timestamp(t["exit_time"]).strftime("%Y-%m-%d %H:%M")
-            if t["exit_time"] else "—"
-        )
+        entry_str = fmt_ts(t["entry_time"])
+        exit_str  = fmt_ts(t["exit_time"])
 
         reason_colors = {
             "stop_loss":      "red",
@@ -292,8 +277,8 @@ def main() -> None:
 
     # ---- Fetch data -----------------------------------------------
     console.print("[bold]Step 1 / 4 — Fetching historical data…[/bold]")
+    df_daily: pd.DataFrame
     df_4h: pd.DataFrame
-    df_1h: pd.DataFrame
 
     with Progress(
         SpinnerColumn(),
@@ -305,25 +290,25 @@ def main() -> None:
     ) as progress:
         t1 = progress.add_task("Daily (trend) — fetching OHLCV…", total=None)
         try:
-            df_4h = fetch_ohlcv(config.SYMBOL, "1d", config.LOOKBACK_DAYS)
+            df_daily = fetch_ohlcv(config.SYMBOL, "1d", config.LOOKBACK_DAYS)
         except Exception as exc:
             console.print(f"[red]Failed to fetch daily data: {exc}[/red]")
             sys.exit(1)
-        progress.update(t1, description=f"[green]Daily data fetched ({len(df_4h)} bars)[/green]", completed=True)
+        progress.update(t1, description=f"[green]Daily data fetched ({len(df_daily)} bars)[/green]", completed=True)
 
         t2 = progress.add_task("4h (entry) — fetching OHLCV…", total=None)
         try:
-            df_1h = fetch_ohlcv(config.SYMBOL, "4h", config.LOOKBACK_DAYS)
+            df_4h = fetch_ohlcv(config.SYMBOL, "4h", config.LOOKBACK_DAYS)
         except Exception as exc:
             console.print(f"[red]Failed to fetch 4h data: {exc}[/red]")
             sys.exit(1)
-        progress.update(t2, description=f"[green]4h data fetched ({len(df_1h)} bars)[/green]", completed=True)
+        progress.update(t2, description=f"[green]4h data fetched ({len(df_4h)} bars)[/green]", completed=True)
 
     console.print(
+        f"  [green]Daily:[/green] {len(df_daily):,} bars  "
+        f"({df_daily.index[0].strftime('%Y-%m-%d')} → {df_daily.index[-1].strftime('%Y-%m-%d')})\n"
         f"  [green]4h:[/green] {len(df_4h):,} bars  "
-        f"({df_4h.index[0].strftime('%Y-%m-%d')} → {df_4h.index[-1].strftime('%Y-%m-%d')})\n"
-        f"  [green]1h:[/green] {len(df_1h):,} bars  "
-        f"({df_1h.index[0].strftime('%Y-%m-%d')} → {df_1h.index[-1].strftime('%Y-%m-%d')})"
+        f"({df_4h.index[0].strftime('%Y-%m-%d')} → {df_4h.index[-1].strftime('%Y-%m-%d')})"
     )
     console.print()
 
@@ -336,17 +321,17 @@ def main() -> None:
         transient=True,
     ) as progress:
         ti = progress.add_task("Adding indicators…", total=None)
-        df_4h_ind = add_indicators(df_4h, config)
-        df_1h_ind = add_indicators(df_1h, config)
+        df_daily_ind = add_indicators(df_daily, config)
+        df_4h_ind    = add_indicators(df_4h, config)
         progress.update(ti, description="[green]Indicators computed[/green]", completed=True)
 
-    console.print(f"  Indicator columns added: {[c for c in df_4h_ind.columns if c not in ['open','high','low','close','volume']]}")
+    console.print(f"  Indicator columns added: {[c for c in df_daily_ind.columns if c not in ['open','high','low','close','volume']]}")
     console.print()
 
     # ---- Generate signals -----------------------------------------
     console.print("[bold]Step 3 / 4 — Generating signals…[/bold]")
     strategy = MultiTFStrategy(config)
-    signals  = strategy.generate_signals(df_4h_ind, df_1h_ind)
+    signals  = strategy.generate_signals(df_daily_ind, df_4h_ind)
 
     n_long  = int((signals["signal"] ==  1).sum())
     n_short = int((signals["signal"] == -1).sum())
@@ -355,7 +340,7 @@ def main() -> None:
     # ---- Run backtest ---------------------------------------------
     console.print("[bold]Step 4 / 4 — Running backtest engine…[/bold]")
     engine  = BacktestEngine(config)
-    results = engine.run(signals, df_1h_ind)
+    results = engine.run(signals, df_4h_ind)
 
     trades       = results["trades"]
     equity_curve = results["equity_curve"]

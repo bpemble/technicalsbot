@@ -1,8 +1,11 @@
 # Virtual environment
 .venv/
 
-# Paper wallet state (personal trading history + capital)
+# Paper wallet state (personal trading history + capital — never commit)
 paper_wallet.json
+wallet_regime.json
+wallet_swing.json
+wallet_*.json
 
 # Python cache
 __pycache__/

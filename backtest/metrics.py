@@ -72,12 +72,12 @@ def compute_metrics(
     # ----------------------------------------------------------------
     # Sharpe ratio (annualised, 0 risk-free rate)
     # Using equity-curve returns rather than trade returns for a more
-    # accurate hourly sampling.
+    # accurate 4h sampling.
     # ----------------------------------------------------------------
     equity_returns = equity_curve.pct_change().dropna()
     if len(equity_returns) > 1:
-        # Hourly data → 24*365 periods per year
-        periods_per_year = 24 * 365
+        # 4h bars: 6 bars/day × 365 days
+        periods_per_year = 6 * 365
         mean_ret = equity_returns.mean()
         std_ret  = equity_returns.std(ddof=1)
         sharpe   = (mean_ret / std_ret * np.sqrt(periods_per_year)) if std_ret > 0 else 0.0
@@ -99,7 +99,10 @@ def compute_metrics(
     # ----------------------------------------------------------------
     gross_profit = sum(t["pnl"] for t in wins)
     gross_loss   = abs(sum(t["pnl"] for t in loses))
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
+    if gross_loss == 0:
+        profit_factor = float("inf")
+    else:
+        profit_factor = gross_profit / gross_loss
 
     # ----------------------------------------------------------------
     # Win / loss averages
@@ -139,7 +142,7 @@ def compute_metrics(
         "max_drawdown":      round(max_drawdown, 2),
         "sharpe_ratio":      round(float(sharpe), 3),
         "sortino_ratio":     round(float(sortino), 3),
-        "profit_factor":     round(profit_factor, 3),
+        "profit_factor":     profit_factor if profit_factor == float("inf") else round(profit_factor, 3),
         "avg_win":           round(avg_win, 2),
         "avg_loss":          round(avg_loss, 2),
         "avg_win_pct":       round(avg_win_pct, 4),

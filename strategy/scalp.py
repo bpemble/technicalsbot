@@ -35,7 +35,7 @@ class ScalpStrategy:
         Align 1h bias onto 15m bars (no lookahead).
         Shift 1h index forward by 1h so bar[i] only influences bars after its close.
         Returns DataFrame indexed by 15m timestamps with columns:
-          signal, stop_loss, take_profit, position_size, atr_at_signal, close_at_signal
+          signal, stop_loss, take_profit, atr_at_signal, close_at_signal
         """
         cfg = self.config
 
@@ -92,7 +92,6 @@ class ScalpStrategy:
         out["signal"]          = 0
         out["stop_loss"]       = np.nan
         out["take_profit"]     = np.nan
-        out["position_size"]   = np.nan
         out["atr_at_signal"]   = atr
         out["close_at_signal"] = close
 
@@ -106,12 +105,5 @@ class ScalpStrategy:
         out.loc[long_mask,  "take_profit"] = close[long_mask]  + atr[long_mask]  * cfg.SCALP_ATR_TP
         out.loc[short_mask, "stop_loss"]   = close[short_mask] + atr[short_mask] * cfg.SCALP_ATR_STOP
         out.loc[short_mask, "take_profit"] = close[short_mask] - atr[short_mask] * cfg.SCALP_ATR_TP
-
-        stop_dist   = atr * cfg.SCALP_ATR_STOP
-        dollar_risk = cfg.PAPER_CAPITAL * cfg.SCALP_RISK_PER_TRADE
-        raw_size    = dollar_risk / stop_dist.replace(0, np.nan)
-        max_size    = (cfg.PAPER_CAPITAL * cfg.LEVERAGE) / close.replace(0, np.nan)
-        sig_mask    = long_mask | short_mask
-        out.loc[sig_mask, "position_size"] = raw_size[sig_mask].clip(upper=max_size[sig_mask])
 
         return out

@@ -1,0 +1,55 @@
+# ============================================================
+# systemd service unit — Ethereal Capital Regime Trader
+#
+# SETUP (on the server):
+#   1. Edit the three lines marked EDIT below.
+#   2. Copy to systemd:
+#        sudo cp regime-trader.service /etc/systemd/system/
+#   3. Set your API credentials (only needed for live trading):
+#        sudo systemctl edit regime-trader
+#        # Add under [Service]:
+#        #   Environment="HL_PRIVATE_KEY=0xabc123..."
+#        #   Environment="HL_WALLET_ADDRESS=0xdef456..."
+#   4. Enable and start:
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable regime-trader
+#        sudo systemctl start regime-trader
+#
+# USEFUL COMMANDS:
+#   sudo systemctl status regime-trader     # check if running
+#   sudo systemctl stop regime-trader       # graceful stop
+#   sudo journalctl -u regime-trader -f     # live service logs
+#   tail -f /path/to/bot/bot.log            # application logs
+#   tail -f /path/to/bot/stdout.log         # console output
+# ============================================================
+
+[Unit]
+Description=Ethereal Capital — Multi-Asset Regime Trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# EDIT: set to the Linux user that owns the bot directory
+User=ubuntu
+
+# EDIT: absolute path to the bot directory on the server
+WorkingDirectory=/home/ubuntu/technicals-bot
+
+# EDIT: absolute path to the Python binary inside your venv
+ExecStart=/home/ubuntu/technicals-bot/.venv/bin/python regime_trade.py
+
+# Auto-restart on crash; wait 30s before retrying to avoid tight loops
+Restart=on-failure
+RestartSec=30
+
+# Redirect console output (Rich) to a separate file alongside bot.log
+StandardOutput=append:/home/ubuntu/technicals-bot/stdout.log
+StandardError=append:/home/ubuntu/technicals-bot/stderr.log
+
+# Give the process time to shut down cleanly on SIGINT before force-killing
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -21,6 +21,8 @@ import pandas as pd
 from dataclasses import dataclass, field
 from typing import Optional
 
+import config
+
 
 @dataclass
 class RegimeSnapshot:
@@ -33,35 +35,37 @@ class RegimeSnapshot:
     latest_price: float = 0.0
 
 
-# Minimum absolute score to hold any position (deadzone avoids thrashing)
-MIN_CONVICTION_SCORE = 15.0
-
-
 class RegimeEngine:
     """
     Computes a market regime score from multiple timeframes and indicators.
 
     Indicator components (each normalised to [-1, +1]):
 
-    1. RSI component
+    1. RSI — momentum / overbought-oversold
        Oversold (RSI < 30) → strongly bullish (+1)
        Overbought (RSI > 70) → strongly bearish (-1)
-       Neutral (RSI = 50) → 0
        Formula: clip((50 - RSI) / 35, -1, 1)
 
-    2. EMA trend component
+    2. EMA trend — direction
        Price above both EMAs AND fast > slow  → +1  (strong uptrend)
        Price below both EMAs AND fast < slow  → -1  (strong downtrend)
        Mixed                                  → ±0.5
 
-    3. MACD momentum component
-       MACD histogram normalised by a rolling ATR proxy.
+    3. MACD momentum — acceleration
+       MACD histogram normalised by ATR.
        Positive & growing → bullish; negative & shrinking → bearish.
 
-    4. Bollinger Band mean-reversion component
-       Price near/below lower band → bullish (oversold stretch)
-       Price near/above upper band → bearish (overbought stretch)
-       Formula: clip((bb_mid - close) / (bb_upper - bb_mid), -1, 1)
+    4. BB bandwidth/squeeze — volatility expansion
+       Expanding bands after squeeze → trend acceleration (follow price vs mid)
+       Contracting bands → mean-reversion likely, reduce conviction
+
+    5. Volume confirmation — flow strength
+       High volume amplifies the candle's direction; low volume weakens it.
+       candle_dir × clip((volume / volume_sma − 1) / 1.5, −1, 1)
+
+    ADX multiplier (applied after scoring):
+       ADX < 15 → 0.2×  (ranging/choppy — all components suppressed)
+       ADX = 30 → 1.0×  (clearly trending — full weight)
     """
 
     def __init__(self, config):
@@ -105,22 +109,26 @@ class RegimeEngine:
             row = df.iloc[-1]
             scores = self._score_row(row, tf_name)
             indicator_scores[tf_name] = scores
-            component_scores[tf_name] = float(np.mean(list(scores.values())))
+            # Average only over non-NaN values
+            vals = [v for v in scores.values() if v is not None and not np.isnan(v)]
+            component_scores[tf_name] = float(np.mean(vals)) if vals else 0.0
 
         # Weighted composite
         raw = sum(component_scores[tf] * weights[tf] for tf in weights)
         score = float(np.clip(raw * 100, -100, 100))
 
-        if score > MIN_CONVICTION_SCORE:
+        if score > config.MIN_CONVICTION_SCORE:
             direction = "long"
-        elif score < -MIN_CONVICTION_SCORE:
+        elif score < -config.MIN_CONVICTION_SCORE:
             direction = "short"
         else:
             direction = "flat"
 
         conviction = abs(score) / 100.0
 
-        latest_price = float(df_15m["close"].iloc[-1]) if not df_15m.empty else 0.0
+        # NaN guard on latest_price
+        lp = float(df_15m["close"].iloc[-1]) if not df_15m.empty else 0.0
+        latest_price = lp if not np.isnan(lp) else 0.0
 
         return RegimeSnapshot(
             score=score,
@@ -165,18 +173,47 @@ class RegimeEngine:
         # ---- 3. MACD momentum ---------------------------------------
         macd_hist = self._safe(row, "macd_hist")
         atr       = self._safe(row, "atr")
-        if macd_hist is not None and atr is not None and atr > 0:
+        if macd_hist is not None and atr is not None:
+            # Floor ATR to avoid division by near-zero
+            atr_safe = max(atr, 1e-8)
             # Normalise histogram by ATR so it's comparable across price levels
-            scores["macd"] = float(np.clip(macd_hist / atr, -1.0, 1.0))
+            scores["macd"] = float(np.clip(macd_hist / atr_safe, -1.0, 1.0))
 
-        # ---- 4. Bollinger Band mean-reversion -----------------------
+        # ---- 4. BB bandwidth/squeeze component ----------------------
+        # Expanding bands after squeeze → trend acceleration (follow direction of price vs mid)
+        # Contracting bands → mean-reversion likely, reduce conviction
         bb_upper = self._safe(row, "bb_upper")
-        bb_mid   = self._safe(row, "bb_mid")
         bb_lower = self._safe(row, "bb_lower")
-        if close is not None and bb_upper is not None and bb_mid is not None and bb_lower is not None:
-            band_half = bb_upper - bb_mid
-            if band_half > 0:
-                scores["bb_reversion"] = float(np.clip((bb_mid - close) / band_half, -1.0, 1.0))
+        bb_mid   = self._safe(row, "bb_mid")
+        if bb_upper is not None and bb_lower is not None and bb_mid is not None and bb_mid > 0:
+            bandwidth = (bb_upper - bb_lower) / bb_mid  # normalised bandwidth
+            if close is not None:
+                direction_sign = 1.0 if close > bb_mid else -1.0
+                normalised_bw = float(np.clip(bandwidth / 0.08, 0, 1))
+                scores["bb_bandwidth"] = direction_sign * normalised_bw
+
+        # ---- 5. Volume confirmation ----------------------------------
+        # High volume amplifies the candle's direction; low volume weakens it.
+        # Uses candle open vs close for intrabar direction.
+        open_price = self._safe(row, "open")
+        volume     = self._safe(row, "volume")
+        volume_sma = self._safe(row, "volume_sma")
+        if (volume is not None and volume_sma is not None and volume_sma > 0
+                and open_price is not None and close is not None):
+            candle_dir = 1.0 if close >= open_price else -1.0
+            ratio      = volume / volume_sma
+            # ratio=1.0 → 0, ratio=2.5 → +1, ratio=0.1 → -0.6
+            normalised = float(np.clip((ratio - 1.0) / 1.5, -1.0, 1.0))
+            scores["volume"] = candle_dir * normalised
+
+        # ---- 6. ADX trend-quality multiplier ------------------------
+        # Scales ALL components down when the market is ranging (low ADX).
+        # ADX < 15 → 0.2×  (choppy — little signal value)
+        # ADX = 30 → 1.0×  (clearly trending — full weight)
+        adx = self._safe(row, "adx")
+        if adx is not None:
+            multiplier = float(np.clip((adx - 15.0) / 15.0, 0.2, 1.0))
+            scores = {k: v * multiplier for k, v in scores.items()}
 
         return scores
 

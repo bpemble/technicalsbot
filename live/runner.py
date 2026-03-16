@@ -7,9 +7,13 @@ paper trades via PaperWallet.
 import time
 import signal
 import sys
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
 
 import pandas as pd
+
+from utils import fmt_ts, fmt_now
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -21,6 +25,15 @@ from indicators.compute import add_indicators
 from strategy.multi_tf import MultiTFStrategy
 from strategy.scalp import ScalpStrategy
 from live.paper_wallet import PaperWallet
+
+_log_handler = RotatingFileHandler(
+    config.LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3
+)
+_log_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+)
+logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
+logger = logging.getLogger(__name__)
 
 console = Console()
 _running = True
@@ -85,11 +98,13 @@ def check_stops(wallet: PaperWallet, current_price: float, exchange_fee: float):
             trade = wallet.close_position(strategy, exit_price, exit_reason, fee)
             if trade:
                 pnl_color = "green" if trade["net_pnl"] >= 0 else "red"
-                console.print(
-                    f"  [{pnl_color}]CLOSED {strategy} {direction.upper()} "
+                msg = (
+                    f"CLOSED {strategy} {direction.upper()} "
                     f"@ ${exit_price:,.2f} ({exit_reason})  "
-                    f"PnL: ${trade['net_pnl']:+,.2f}[/{pnl_color}]"
+                    f"PnL: ${trade['net_pnl']:+,.2f}"
                 )
+                console.print(f"  [{pnl_color}]{msg}[/{pnl_color}]")
+                logger.info(msg)
             closed.append(strategy)
     return closed
 
@@ -101,6 +116,7 @@ def try_entry(
     current_price: float,
     risk_pct: float,
     atr_stop: float,
+    atr_tp: float,
     exchange_fee: float,
 ):
     """Check latest signal row and open a paper position if signalled."""
@@ -123,9 +139,9 @@ def try_entry(
 
     stop_loss   = fill - stop_dist if sig == 1 else fill + stop_dist
     take_profit = (
-        fill + atr_val * (config.ATR_TP_MULTIPLIER if "swing" in strategy_name else config.SCALP_ATR_TP)
+        fill + atr_val * atr_tp
         if sig == 1
-        else fill - atr_val * (config.ATR_TP_MULTIPLIER if "swing" in strategy_name else config.SCALP_ATR_TP)
+        else fill - atr_val * atr_tp
     )
 
     dollar_risk = wallet.capital * risk_pct
@@ -137,11 +153,13 @@ def try_entry(
     wallet.open_position(strategy_name, direction, fill, size, stop_loss, take_profit, fee)
 
     dir_color = "cyan" if direction == "long" else "magenta"
-    console.print(
-        f"  [{dir_color}]OPENED {strategy_name} {direction.upper()} "
+    msg = (
+        f"OPENED {strategy_name} {direction.upper()} "
         f"@ ${fill:,.2f}  size={size:.4f} ETH  "
-        f"SL=${stop_loss:,.2f}  TP=${take_profit:,.2f}[/{dir_color}]"
+        f"SL=${stop_loss:,.2f}  TP=${take_profit:,.2f}"
     )
+    console.print(f"  [{dir_color}]{msg}[/{dir_color}]")
+    logger.info(msg)
 
 
 # ------------------------------------------------------------------
@@ -177,8 +195,7 @@ def print_status(wallet: PaperWallet, current_price: float):
             f"${upnl_pos:+,.2f}[/{c}]"
         )
 
-    ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    console.print(Panel(table, title=f"[bold cyan]Paper Wallet — {ts}[/bold cyan]", border_style="cyan", expand=False))
+    console.print(Panel(table, title=f"[bold cyan]Paper Wallet — {fmt_now()}[/bold cyan]", border_style="cyan", expand=False))
 
 
 # ------------------------------------------------------------------
@@ -195,7 +212,7 @@ def run():
         border_style="cyan", expand=False,
     ))
 
-    wallet = PaperWallet(config.PAPER_STATE_FILE, config.PAPER_CAPITAL)
+    wallet = PaperWallet(config.SWING_STATE_FILE, config.PAPER_CAPITAL)
     swing  = MultiTFStrategy(config)
     scalp  = ScalpStrategy(config)
 
@@ -206,7 +223,7 @@ def run():
     tick = 0
     while _running:
         tick += 1
-        console.rule(f"[dim]Tick {tick} — {datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}[/dim]")
+        console.rule(f"[dim]Tick {tick} — {fmt_now()}[/dim]")
 
         # ---- Fetch data ------------------------------------------
         try:
@@ -221,10 +238,15 @@ def run():
         current_price = float(frames["15m"]["close"].iloc[-1])
 
         # ---- Compute indicators ----------------------------------
-        df_daily_ind = add_indicators(frames["1d"], config)
-        df_4h_ind    = add_indicators(frames["4h"], config)
-        df_1h_ind    = add_indicators(frames["1h"], config)
-        df_15m_ind   = add_indicators(frames["15m"], config)
+        try:
+            df_daily_ind = add_indicators(frames["1d"], config)
+            df_4h_ind    = add_indicators(frames["4h"], config)
+            df_1h_ind    = add_indicators(frames["1h"], config)
+            df_15m_ind   = add_indicators(frames["15m"], config)
+        except Exception as exc:
+            console.print(f"[red]Indicator error: {exc}[/red]")
+            time.sleep(config.POLL_INTERVAL_SEC)
+            continue
 
         # ---- Check stops on open positions ----------------------
         check_stops(wallet, current_price, config.EXCHANGE_FEE)
@@ -238,11 +260,44 @@ def run():
             time.sleep(config.POLL_INTERVAL_SEC)
             continue
 
+        # ---- Check for signal reversals -------------------------
+        # Check for signal reversal on swing
+        if wallet.has_position("swing"):
+            pos = wallet.get_position("swing")
+            last_swing_sig = int(swing_signals.iloc[-1]["signal"])
+            if (pos["direction"] == "long" and last_swing_sig == -1) or \
+               (pos["direction"] == "short" and last_swing_sig == 1):
+                price = float(df_4h_ind["close"].iloc[-1])
+                fee = pos["size"] * price * config.EXCHANGE_FEE
+                trade = wallet.close_position("swing", price, "signal_reverse", fee)
+                if trade:
+                    pnl_color = "green" if trade["net_pnl"] >= 0 else "red"
+                    msg = f"REVERSED swing @ ${price:,.2f}  PnL: ${trade['net_pnl']:+,.2f}"
+                    console.print(f"  [{pnl_color}]{msg}[/{pnl_color}]")
+                    logger.info(msg)
+
+        # Same for scalp
+        if wallet.has_position("scalp"):
+            pos = wallet.get_position("scalp")
+            last_scalp_sig = int(scalp_signals.iloc[-1]["signal"])
+            if (pos["direction"] == "long" and last_scalp_sig == -1) or \
+               (pos["direction"] == "short" and last_scalp_sig == 1):
+                price = float(df_15m_ind["close"].iloc[-1])
+                fee = pos["size"] * price * config.EXCHANGE_FEE
+                trade = wallet.close_position("scalp", price, "signal_reverse", fee)
+                if trade:
+                    pnl_color = "green" if trade["net_pnl"] >= 0 else "red"
+                    msg = f"REVERSED scalp @ ${price:,.2f}  PnL: ${trade['net_pnl']:+,.2f}"
+                    console.print(f"  [{pnl_color}]{msg}[/{pnl_color}]")
+                    logger.info(msg)
+
         # ---- Try entries ----------------------------------------
         try_entry(wallet, "swing", swing_signals, current_price,
-                  config.RISK_PER_TRADE, config.ATR_STOP_MULTIPLIER, config.EXCHANGE_FEE)
+                  config.RISK_PER_TRADE, config.ATR_STOP_MULTIPLIER,
+                  config.ATR_TP_MULTIPLIER, config.EXCHANGE_FEE)
         try_entry(wallet, "scalp", scalp_signals, current_price,
-                  config.SCALP_RISK_PER_TRADE, config.SCALP_ATR_STOP, config.EXCHANGE_FEE)
+                  config.SCALP_RISK_PER_TRADE, config.SCALP_ATR_STOP,
+                  config.SCALP_ATR_TP, config.EXCHANGE_FEE)
 
         # ---- Print status ----------------------------------------
         print_status(wallet, current_price)

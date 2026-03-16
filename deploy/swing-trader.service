@@ -1,0 +1,20 @@
+# Swing/scalp trader variant — see regime-trader.service for full setup notes.
+
+[Unit]
+Description=Ethereal Capital — Swing/Scalp Trader (ETH only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu                                                      # EDIT
+WorkingDirectory=/home/ubuntu/technicals-bot                     # EDIT
+ExecStart=/home/ubuntu/technicals-bot/.venv/bin/python paper_trade.py  # EDIT venv path
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/ubuntu/technicals-bot/stdout-swing.log
+StandardError=append:/home/ubuntu/technicals-bot/stderr-swing.log
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

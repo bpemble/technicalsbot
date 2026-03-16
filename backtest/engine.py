@@ -2,6 +2,7 @@
 # backtest/engine.py — Event-driven backtesting loop
 # ============================================================
 
+import sys
 import pandas as pd
 import numpy as np
 from typing import Optional
@@ -9,7 +10,7 @@ from typing import Optional
 
 class BacktestEngine:
     """
-    Iterates through 1h candles and simulates order execution.
+    Iterates through 4h candles and simulates order execution.
 
     Cost model
     ----------
@@ -17,7 +18,7 @@ class BacktestEngine:
     - Exit fee    : EXCHANGE_FEE (taker) applied to notional at exit
     - Slippage    : SLIPPAGE fraction added to cost on entries (widens spread)
     - Funding     : FUNDING_RATE_DAILY / 3  per 8h interval, charged every
-                    8 candles (once per 8h funding period)
+                    2 candles on 4h data (= 8h funding period)
 
     Intracandle stop / TP logic
     ---------------------------
@@ -52,7 +53,7 @@ class BacktestEngine:
         signals_df : Output of MultiTFStrategy.generate_signals().
                      Must contain: signal, stop_loss, take_profit,
                                    atr_at_signal, close_at_signal
-        price_df   : 1h OHLCV DataFrame (same index as signals_df ideally,
+        price_df   : 4h OHLCV DataFrame (same index as signals_df ideally,
                      but can be the raw fetched frame).
 
         Returns
@@ -66,6 +67,9 @@ class BacktestEngine:
 
         # Align on common index
         common_idx = signals_df.index.intersection(price_df.index)
+        dropped = len(signals_df) - len(common_idx)
+        if dropped > 0:
+            print(f"Warning: {dropped} bars dropped due to index mismatch between signals and price data", file=sys.stderr)
         signals_df = signals_df.loc[common_idx]
         price_df   = price_df.loc[common_idx]
 
@@ -102,8 +106,8 @@ class BacktestEngine:
                 candles_in_trade += 1
                 notional_now = position_size * candle_open
 
-                # Funding: charged every 8 candles (≈ every 8h)
-                if candles_in_trade % 8 == 0:
+                # Funding: charged every 2 candles on 4h data (= 8h funding period)
+                if candles_in_trade % 2 == 0:
                     funding_charge = notional_now * (cfg.FUNDING_RATE_DAILY / 3)
                     funding_accrued += funding_charge
 

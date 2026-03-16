@@ -4,6 +4,7 @@ Tracks capital, open positions, and closed trade history.
 """
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -20,17 +21,33 @@ class PaperWallet:
 
     def _load(self) -> dict:
         if os.path.exists(self.state_file):
-            with open(self.state_file) as f:
-                return json.load(f)
+            try:
+                with open(self.state_file) as f:
+                    data = json.load(f)
+                # Fallback: persist initial_capital if missing from file
+                if "initial_capital" not in data:
+                    data["initial_capital"] = self.initial_capital
+                return data
+            except json.JSONDecodeError as e:
+                print(f"Warning: corrupt wallet file ({e}), starting fresh", file=sys.stderr)
+                return {
+                    "capital": self.initial_capital,
+                    "initial_capital": self.initial_capital,
+                    "positions": {},
+                    "trades": [],
+                }
         return {
             "capital": self.initial_capital,
+            "initial_capital": self.initial_capital,
             "positions": {},   # strategy_name -> position dict
             "trades": [],
         }
 
     def save(self):
-        with open(self.state_file, "w") as f:
+        tmp = self.state_file + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(self.state, f, indent=2, default=str)
+        os.replace(tmp, self.state_file)
 
     # ------------------------------------------------------------------
     # Capital
@@ -64,6 +81,8 @@ class PaperWallet:
         take_profit: float,
         fee: float,
     ):
+        if strategy in self.state["positions"]:
+            raise ValueError(f"Position already open for {strategy}")
         self.state["capital"] -= fee
         self.state["positions"][strategy] = {
             "strategy":    strategy,
@@ -140,4 +159,5 @@ class PaperWallet:
         return self.state["positions"]
 
     def total_return_pct(self) -> float:
-        return ((self.capital - self.initial_capital) / self.initial_capital) * 100
+        ic = self.state.get("initial_capital", self.initial_capital)
+        return ((self.capital - ic) / ic) * 100
