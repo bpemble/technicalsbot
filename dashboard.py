@@ -152,7 +152,7 @@ HTML = r"""<!DOCTYPE html>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;1,300;1,400&family=Inter:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
   :root {
     --bg:        #07080c;
@@ -170,7 +170,7 @@ HTML = r"""<!DOCTYPE html>
     --green-dim: rgba(34,197,94,0.10);
     --red-dim:   rgba(248,113,113,0.10);
     --radius:    8px;
-    --font:      -apple-system, 'Segoe UI', system-ui, sans-serif;
+    --font:      'Inter', -apple-system, 'Segoe UI', system-ui, sans-serif;
     --mono:      'SF Mono', 'Fira Code', 'Consolas', monospace;
     --serif:     'Cormorant Garamond', Georgia, 'Times New Roman', serif;
   }
@@ -194,11 +194,12 @@ HTML = r"""<!DOCTYPE html>
     background: var(--surface);
     position: sticky; top: 0; z-index: 100;
   }
-  .logo { display: flex; align-items: center; gap: 14px; }
-  .logo-mark { font-family: var(--serif); font-size: 28px; color: var(--gold); font-weight: 300; letter-spacing: -1px; line-height: 1; }
-  .logo-text { display: flex; flex-direction: column; gap: 2px; }
-  .logo-title { font-family: var(--serif); font-size: 18px; font-weight: 500; letter-spacing: 0.08em; color: var(--text); }
-  .logo-sub { font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--muted); }
+  .logo { display: flex; align-items: center; gap: 16px; }
+  .logo-mark { font-family: var(--serif); font-size: 38px; font-style: italic; color: var(--gold); font-weight: 400; letter-spacing: 0; line-height: 1; text-shadow: 0 0 24px rgba(200,169,110,0.25); }
+  .logo-divider { width: 1px; height: 32px; background: linear-gradient(to bottom, transparent, var(--gold), transparent); opacity: 0.4; flex-shrink: 0; }
+  .logo-text { display: flex; flex-direction: column; gap: 3px; }
+  .logo-title { font-family: var(--serif); font-size: 19px; font-style: italic; font-weight: 400; letter-spacing: 0.13em; color: var(--text); }
+  .logo-sub { font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted); }
   .header-right { display: flex; align-items: center; gap: 18px; }
   .live-badge { display: flex; align-items: center; gap: 6px; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
   .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse 2s ease-in-out infinite; }
@@ -233,7 +234,7 @@ HTML = r"""<!DOCTYPE html>
   .stats-bar { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
   .stat { background: var(--surface); padding: 14px 18px; display: flex; flex-direction: column; gap: 3px; }
   .stat-label { font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
-  .stat-value { font-size: 22px; font-weight: 400; font-family: var(--serif); letter-spacing: 0.01em; }
+  .stat-value { font-size: 20px; font-weight: 300; font-family: var(--font); letter-spacing: -0.01em; }
   .stat-value.pos { color: var(--green); }
   .stat-value.neg { color: var(--red); }
   .stat-value.gold { color: var(--gold); }
@@ -241,12 +242,11 @@ HTML = r"""<!DOCTYPE html>
   .stat-sub.pos { color: var(--green); }
   .stat-sub.neg { color: var(--red); }
 
-  /* ── Countdown ── */
-  #countdown-ring {
-    width: 36px; height: 36px; flex-shrink: 0;
-  }
-  .countdown-wrap { display: flex; align-items: center; gap: 10px; }
-  .countdown-label { display: flex; flex-direction: column; gap: 2px; }
+  /* ── Countdown ring ── */
+  .countdown-ring-wrap { display: flex; align-items: center; opacity: 0.85; }
+  .ring-bg   { stroke: rgba(255,255,255,0.06); }
+  .ring-fill { stroke: var(--gold); transition: stroke-dashoffset 0.5s linear; }
+  .ring-text { fill: var(--muted); font-family: var(--mono); font-size: 8px; }
 
   /* ── Grid ── */
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
@@ -277,8 +277,10 @@ HTML = r"""<!DOCTYPE html>
   .pos-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 9px; letter-spacing: 0.06em; font-weight: 600; }
   .pos-badge.open { background: var(--green-dim); color: var(--green); }
 
-  .tier-badge { display: inline-block; width: 14px; height: 14px; border-radius: 2px; font-size: 8px; font-weight: 700; text-align: center; line-height: 14px; color: var(--bg); background: var(--muted); opacity: 0.6; }
-  .tier-1 { background: var(--gold); opacity: 1; }
+  .tier-badge { display: inline-block; width: 14px; height: 14px; border-radius: 2px; font-size: 8px; font-weight: 700; text-align: center; line-height: 14px; }
+  .tier-1 { background: var(--gold); color: #07080c; }
+  .tier-2 { background: #7a8799; color: #07080c; }
+  .tier-3 { background: #7a5c3e; color: #e8c9a8; }
 
   .score-bar-wrap { display: flex; align-items: center; width: 90px; }
   .score-bar-track { flex: 1; height: 3px; background: var(--surface2); border-radius: 2px; overflow: hidden; }
@@ -311,7 +313,7 @@ HTML = r"""<!DOCTYPE html>
     min-width: 140px;
   }
   .tt-label { font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); margin-bottom: 3px; }
-  .tt-value { font-size: 20px; font-weight: 400; font-family: var(--serif); color: var(--text); letter-spacing: 0.01em; }
+  .tt-value { font-size: 16px; font-weight: 300; font-family: var(--font); color: var(--text); }
   .tt-change { font-size: 11px; font-family: var(--mono); margin-top: 2px; }
   .tt-time   { font-size: 10px; color: var(--muted); font-family: var(--mono); margin-top: 4px; }
 
@@ -328,6 +330,7 @@ HTML = r"""<!DOCTYPE html>
 <header>
   <div class="logo">
     <div class="logo-mark">∞</div>
+    <div class="logo-divider"></div>
     <div class="logo-text">
       <div class="logo-title">Ethereal Capital</div>
       <div class="logo-sub">Hyperliquid Bot</div>
@@ -335,6 +338,15 @@ HTML = r"""<!DOCTYPE html>
   </div>
   <div class="header-right">
     <div id="last-scan-label" style="font-size:10px;color:var(--muted)">—</div>
+    <div class="countdown-ring-wrap" title="Next regime scan">
+      <svg id="countdown-ring" viewBox="0 0 36 36" width="36" height="36">
+        <circle class="ring-bg"   cx="18" cy="18" r="14" fill="none" stroke-width="2.5"/>
+        <circle class="ring-fill" cx="18" cy="18" r="14" fill="none" stroke-width="2.5"
+                stroke-dasharray="87.96" stroke-dashoffset="87.96"
+                transform="rotate(-90 18 18)" id="ring-arc"/>
+        <text class="ring-text" x="18" y="21" text-anchor="middle" id="ring-text">—</text>
+      </svg>
+    </div>
     <button class="btn-refresh" id="btn-refresh" onclick="manualRefresh()">
       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
       Refresh
@@ -488,7 +500,7 @@ const fmt = {
   ts: s => {
     if (!s) return '—';
     const d = new Date(s);
-    return d.toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false});
+    return d.toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/Chicago'});
   },
 };
 
@@ -708,7 +720,7 @@ function renderRegime(assets, openNames) {
                : `<span style="color:var(--long)">${(fr*100).toFixed(3)}%</span>`;
     html += `<tr>
       <td>${a.name}${isOpen?` <span class="pos-badge open">OPEN</span>`:''}</td>
-      <td style="text-align:center"><span class="tier-badge ${a.tier===1?'tier-1':''}">${a.tier}</span></td>
+      <td style="text-align:center"><span class="tier-badge tier-${a.tier}">${a.tier}</span></td>
       <td>${fmt.price(a.price)}</td>
       <td class="${sc}">${fmt.score(a.score)}</td>
       <td style="color:var(--muted)">${(a.conviction*100).toFixed(0)}%</td>
@@ -741,13 +753,32 @@ function renderTrades(trades) {
 }
 
 // ── Countdown ─────────────────────────────────────────────────────────────────
+const RING_CIRC = 87.96; // 2π × r=14
 function startCountdown() {
   clearInterval(_countdownIv);
   _countdownIv = setInterval(() => {
-    if (!_lastScanIso) { set('s-countdown', '—'); return; }
-    const elapsed = (Date.now() - new Date(_lastScanIso)) / 1000;
-    const remaining = Math.max(0, Math.ceil(_scanInterval - elapsed));
-    set('s-countdown', `${remaining}s`);
+    const arc = document.getElementById('ring-arc');
+    const ringTxt = document.getElementById('ring-text');
+    if (!_lastScanIso || !_scanInterval) {
+      set('s-countdown', '—');
+      if (arc) arc.style.strokeDashoffset = RING_CIRC;
+      if (ringTxt) ringTxt.textContent = '—';
+      return;
+    }
+    const elapsed   = (Date.now() - new Date(_lastScanIso)) / 1000;
+    const remaining = Math.max(0, _scanInterval - elapsed);
+    const pct       = remaining / _scanInterval;
+
+    // Stats bar — M:SS
+    const m = Math.floor(remaining / 60);
+    const s = Math.floor(remaining % 60);
+    set('s-countdown', `${m}:${String(s).padStart(2, '0')}`);
+
+    // SVG ring — depletes as scan approaches; fill when fresh
+    if (arc) arc.style.strokeDashoffset = RING_CIRC * (1 - pct);
+    if (ringTxt) ringTxt.textContent = remaining > 59
+      ? `${Math.ceil(remaining / 60)}m`
+      : `${Math.ceil(remaining)}`;
   }, 500);
 }
 
@@ -778,7 +809,7 @@ async function refresh(manual = false) {
     renderTrades(d.trades);
     renderEquityCurve(d.equity_curve, d.initial);
 
-    set('last-scan-label', `updated ${new Date().toLocaleTimeString()}`);
+    set('last-scan-label', `updated ${new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/Chicago'})} CT`);
     document.getElementById('stale-warn').style.display = 'none';
     document.getElementById('live-dot').style.cssText = 'background:var(--green);box-shadow:0 0 6px var(--green)';
     startCountdown();
@@ -796,7 +827,7 @@ function manualRefresh() { refresh(true); }
 // ── Clock ─────────────────────────────────────────────────────────────────────
 setInterval(() => {
   document.getElementById('clock').textContent =
-    new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit',timeZone:'America/Chicago'});
 }, 1000);
 
 // ── Boot ──────────────────────────────────────────────────────────────────────

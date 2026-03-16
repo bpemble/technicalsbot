@@ -45,7 +45,7 @@ console = Console()
 _running = True
 
 HARD_STOP_PCT       = 0.08   # 8% hard circuit breaker
-REBALANCE_THRESHOLD = 0.10   # only resize if >10% off target
+REBALANCE_THRESHOLD = 0.15   # only resize if >15% off target
 
 
 def apply_funding_adjustment(score: float, funding_rate: float) -> float:
@@ -162,11 +162,27 @@ def compute_all_regimes(engine: RegimeEngine, cache: DataCache, funding_rates: d
 # ------------------------------------------------------------------
 
 def target_position_size(score: float, equity: float, price: float) -> float:
-    """Compute target position size in asset units given regime score."""
-    conviction = abs(score) / 100.0
-    per_asset  = equity / config.MAX_POSITIONS
-    notional   = per_asset * config.LEVERAGE * conviction
-    return notional / price if price > 0 else 0.0
+    """
+    Per-position half-Kelly sizing with portfolio notional cap.
+
+    Each position is treated as an independent Kelly bet:
+      risk_per_position = KELLY_FRACTION × equity × conviction
+      notional          = risk_per_position / HARD_STOP_PCT
+
+    A hard ceiling ensures total portfolio notional never exceeds
+    MAX_NOTIONAL_FACTOR × equity regardless of conviction level.
+
+    Example at 20% conviction, $10k, 10 positions:
+      notional = $10k × 0.065 × 0.20 / 0.08 = $1,625/position (1.625× total)
+      risk     = $1,300 total = 13% of equity
+
+    Example at 80% conviction (cap kicks in):
+      uncapped = $6,500/position → capped at $2,000 (2× total / 10 slots)
+    """
+    conviction  = abs(score) / 100.0
+    notional    = equity * config.KELLY_FRACTION * conviction / HARD_STOP_PCT
+    notional_cap = equity * config.MAX_NOTIONAL_FACTOR / config.MAX_POSITIONS
+    return min(notional, notional_cap) / price if price > 0 else 0.0
 
 
 # ------------------------------------------------------------------
@@ -585,7 +601,7 @@ def run():
         "[bold cyan]Multi-Asset Regime Trader — Paper Mode[/bold cyan]\n"
         "[dim]Always-in conviction-weighted portfolio[/dim]\n"
         f"[dim]Capital: ${config.PAPER_CAPITAL:,.0f}  |  "
-        f"Leverage: {config.LEVERAGE}x  |  "
+        f"Kelly: {config.KELLY_FRACTION*100:.1f}% (half)  |  "
         f"Hard stop: {HARD_STOP_PCT*100:.0f}%  |  "
         f"Max positions: {config.MAX_POSITIONS}  |  "
         f"Assets: {len(config.ASSETS)}  |  "

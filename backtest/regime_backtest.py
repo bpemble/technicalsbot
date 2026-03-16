@@ -16,10 +16,21 @@ from rich import box
 
 import config
 from utils import fmt_ts
-from data.fetcher import fetch_ohlcv
+from data.fetcher import fetch_hl_candles
 from indicators.compute import add_indicators
 from strategy.regime import RegimeEngine
 from backtest.metrics import compute_metrics
+
+# ETH on Hyperliquid (full paginated history — used instead of Kraken)
+_BT_COIN = "ETH"
+
+def _fetch(interval: str, days: int) -> pd.DataFrame:
+    """Fetch from Hyperliquid with proper pagination for full history."""
+    from datetime import datetime, timedelta, timezone
+    since_ms = int(
+        (datetime.now(tz=timezone.utc) - timedelta(days=days)).timestamp() * 1000
+    )
+    return fetch_hl_candles(_BT_COIN, interval, since_ms)
 
 console = Console()
 
@@ -60,7 +71,7 @@ def run_regime_backtest():
     ) as progress:
         t_1d = progress.add_task("Daily bars…", total=None)
         try:
-            df_1d_raw = fetch_ohlcv(config.SYMBOL, "1d", config.LOOKBACK_DAYS)
+            df_1d_raw = _fetch("1d", config.LOOKBACK_DAYS)
         except Exception as exc:
             console.print(f"[red]Failed to fetch daily data: {exc}[/red]")
             sys.exit(1)
@@ -68,7 +79,7 @@ def run_regime_backtest():
 
         t_4h = progress.add_task("4h bars…", total=None)
         try:
-            df_4h_raw = fetch_ohlcv(config.SYMBOL, "4h", config.LOOKBACK_DAYS)
+            df_4h_raw = _fetch("4h", config.LOOKBACK_DAYS)
         except Exception as exc:
             console.print(f"[red]Failed to fetch 4h data: {exc}[/red]")
             sys.exit(1)
@@ -76,7 +87,7 @@ def run_regime_backtest():
 
         t_1h = progress.add_task("1h bars…", total=None)
         try:
-            df_1h_raw = fetch_ohlcv(config.SYMBOL, "1h", 730)
+            df_1h_raw = _fetch("1h", 730)
         except Exception as exc:
             console.print(f"[yellow]1h fetch failed ({exc}), using empty frame[/yellow]")
             df_1h_raw = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
@@ -84,7 +95,7 @@ def run_regime_backtest():
 
         t_15m = progress.add_task("15m bars…", total=None)
         try:
-            df_15m_raw = fetch_ohlcv(config.SYMBOL, "15m", config.SCALP_LOOKBACK_DAYS)
+            df_15m_raw = _fetch("15m", config.SCALP_LOOKBACK_DAYS)
         except Exception as exc:
             console.print(f"[yellow]15m fetch failed ({exc}), using empty frame[/yellow]")
             df_15m_raw = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])

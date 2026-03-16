@@ -23,8 +23,17 @@ LOOKBACK_DAYS = 730           # 2 years of history (daily); 4h gets ~120 days
 
 # --------------- Capital & Risk ------------------------------
 INITIAL_CAPITAL = 10_000.0   # USDC
-LEVERAGE = 3                  # Conservative leverage
-RISK_PER_TRADE = 0.02         # 2 % of capital risked per trade
+LEVERAGE = 3                  # Used by swing/scalp runner only
+RISK_PER_TRADE = 0.02         # 2 % of capital risked per trade (swing/scalp)
+
+# --------------- Kelly sizing (regime trader) ----------------
+# Full Kelly = 13 % derived from 2-yr backtest (win rate 46 %, avg W/L 1.62×).
+# Half Kelly used for live deployment — conservative starting point.
+# Each position is sized as an independent Kelly bet (6.5 % of equity at risk
+# per position, scaled by conviction), capped so total portfolio notional
+# never exceeds MAX_NOTIONAL_FACTOR × equity.
+KELLY_FRACTION      = 0.065   # half-Kelly (raise toward 0.13 as live data accrues)
+MAX_NOTIONAL_FACTOR = 2.0     # hard ceiling: total notional ≤ 2× equity
 
 # --------------- Stop / TP -----------------------------------
 ATR_STOP_MULTIPLIER = 2.0
