@@ -6,8 +6,6 @@
 import pandas as pd
 import numpy as np
 
-import config as _config
-
 
 def _ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
@@ -123,6 +121,10 @@ def add_indicators(df: pd.DataFrame, config) -> pd.DataFrame:
 
     # ---- RSI -------------------------------------------------------
     df["rsi"] = _rsi(df["close"], config.RSI_PERIOD)
+    # Momentum: direction RSI has moved over the last 5 bars, normalised to [-1, +1].
+    # Rising RSI on a long → bullish; falling RSI on a short → bearish.
+    # Avoids the level-trap where RSI stays "overbought" through entire strong trends.
+    df["rsi_momentum"] = df["rsi"].diff(5).div(30).clip(-1.0, 1.0)
 
     # ---- MACD ------------------------------------------------------
     df["macd"], df["macd_signal"], df["macd_hist"] = _macd(
@@ -140,15 +142,32 @@ def add_indicators(df: pd.DataFrame, config) -> pd.DataFrame:
     # ---- Bollinger Bands -------------------------------------------
     df["bb_upper"], df["bb_mid"], df["bb_lower"] = _bbands(df["close"], 20, 2.0)
 
+    # ---- BB bandwidth (self-calibrating via rolling percentile) ----
+    _bw = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"].replace(0, np.nan)
+    df["bb_bandwidth"]     = _bw
+    df["bb_bandwidth_p90"] = _bw.rolling(config.BB_BW_LOOKBACK, min_periods=10).quantile(0.90)
+
     # ---- Volume SMA ------------------------------------------------
     df["volume_sma"] = df["volume"].rolling(20).mean()
 
     # ---- Derived EMA signal columns --------------------------------
     df["ema_bullish"] = df["ema_fast"] > df["ema_slow"]
 
-    prev_fast = df["ema_fast"].shift(1)
-    prev_slow = df["ema_slow"].shift(1)
-    df["ema_cross_up"]   = (prev_fast <= prev_slow) & (df["ema_fast"] > df["ema_slow"])
-    df["ema_cross_down"] = (prev_fast >= prev_slow) & (df["ema_fast"] < df["ema_slow"])
+    # ---- Normalised ATR (volatility regime) ------------------------
+    # norm_atr     : ATR / close — comparable across price levels.
+    # norm_atr_pct : rolling percentile rank — 0 = historically low vol, 1 = high.
+    _norm_atr = df["atr"] / df["close"].replace(0, np.nan)
+    df["norm_atr"]     = _norm_atr
+    df["norm_atr_pct"] = _norm_atr.rolling(
+        config.NORM_ATR_LOOKBACK, min_periods=10
+    ).rank(pct=True)
+
+    # ---- MA200 distance (extension brake) --------------------------
+    # ma200_dist: (close - MA200) / MA200 — positive = above, negative = below.
+    # NaN until MA200_PERIOD bars are available (no penalty applied upstream).
+    df["ma200"] = df["close"].rolling(
+        config.MA200_PERIOD, min_periods=config.MA200_PERIOD
+    ).mean()
+    df["ma200_dist"] = (df["close"] - df["ma200"]) / df["ma200"].replace(0, np.nan)
 
     return df

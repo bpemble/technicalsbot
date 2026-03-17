@@ -269,7 +269,12 @@ HTML = r"""<!DOCTYPE html>
     position: sticky; top: 0; z-index: 100;
   }
   .logo { display: flex; align-items: center; gap: 16px; }
-  .logo-mark { font-family: var(--serif); font-size: 38px; font-style: italic; color: var(--gold); font-weight: 400; letter-spacing: 0; line-height: 1; text-shadow: 0 0 24px rgba(200,169,110,0.25); }
+  .logo-mark { display:flex; align-items:center; }
+  .logo-mark svg { animation: ouro-glow 4s ease-in-out infinite; }
+  @keyframes ouro-glow {
+    0%,100% { filter: drop-shadow(0 0 4px rgba(200,169,110,0.20)); }
+    50%     { filter: drop-shadow(0 0 11px rgba(200,169,110,0.55)); }
+  }
   .logo-divider { width: 1px; height: 32px; background: linear-gradient(to bottom, transparent, var(--gold), transparent); opacity: 0.4; flex-shrink: 0; }
   .logo-text { display: flex; flex-direction: column; gap: 3px; }
   .logo-title { font-family: var(--serif); font-size: 19px; font-style: italic; font-weight: 400; letter-spacing: 0.13em; color: var(--text); }
@@ -408,7 +413,73 @@ HTML = r"""<!DOCTYPE html>
 
 <header>
   <div class="logo">
-    <div class="logo-mark">∞</div>
+    <div class="logo-mark">
+      <!-- Ouroboros infinity — snake eating its own tail in a figure-8 -->
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 104 52" width="56" height="28" aria-label="Ouroboros" role="img">
+        <defs>
+          <!-- Top-to-bottom gradient gives the body a rounded 3-D feel -->
+          <linearGradient id="sg" x1="0" y1="0" x2="0" y2="52" gradientUnits="userSpaceOnUse">
+            <stop offset="0%"   stop-color="#e8cc88"/>
+            <stop offset="45%"  stop-color="#c8a96e"/>
+            <stop offset="100%" stop-color="#6e460e"/>
+          </linearGradient>
+        </defs>
+
+        <!-- ── LEFT LOBE (tail / under strand — drawn first) ─────────── -->
+        <!-- Dark border -->
+        <path d="M 52,26 C 52,46 34,51 21,51 C 5,51 1,39 1,26 C 1,13 5,1 21,1 C 34,1 52,6 52,26"
+              fill="none" stroke="#1e1004" stroke-width="11" stroke-linecap="round"/>
+        <!-- Gold body -->
+        <path d="M 52,26 C 52,46 34,51 21,51 C 6,51 1,39 1,26 C 1,13 6,1 21,1 C 34,1 52,6 52,26"
+              fill="none" stroke="url(#sg)" stroke-width="7.5" stroke-linecap="round"/>
+        <!-- Scale shimmer — subtle dashed lighter overlay -->
+        <path d="M 52,26 C 52,46 34,51 21,51 C 6,51 1,39 1,26 C 1,13 6,1 21,1 C 34,1 52,6 52,26"
+              fill="none" stroke="rgba(255,248,210,0.20)" stroke-width="7" stroke-linecap="round"
+              stroke-dasharray="2.5 5.5"/>
+        <!-- Spine highlight -->
+        <path d="M 52,26 C 52,46 34,51 21,51 C 6,51 1,39 1,26 C 1,13 6,1 21,1 C 34,1 52,6 52,26"
+              fill="none" stroke="rgba(255,248,210,0.16)" stroke-width="1.8" stroke-linecap="round"/>
+
+        <!-- ── RIGHT LOBE (neck / over strand — drawn second) ────────── -->
+        <!-- Dark border -->
+        <path d="M 52,26 C 52,6 70,1 83,1 C 99,1 103,13 103,26 C 103,39 99,51 83,51 C 70,51 52,46 52,26"
+              fill="none" stroke="#1e1004" stroke-width="11" stroke-linecap="round"/>
+        <!-- Gold body -->
+        <path d="M 52,26 C 52,6 70,1 83,1 C 99,1 103,13 103,26 C 103,39 99,51 83,51 C 70,51 52,46 52,26"
+              fill="none" stroke="url(#sg)" stroke-width="7.5" stroke-linecap="round"/>
+        <!-- Scale shimmer -->
+        <path d="M 52,26 C 52,6 70,1 83,1 C 99,1 103,13 103,26 C 103,39 99,51 83,51 C 70,51 52,46 52,26"
+              fill="none" stroke="rgba(255,248,210,0.20)" stroke-width="7" stroke-linecap="round"
+              stroke-dasharray="2.5 5.5"/>
+        <!-- Spine highlight -->
+        <path d="M 52,26 C 52,6 70,1 83,1 C 99,1 103,13 103,26 C 103,39 99,51 83,51 C 70,51 52,46 52,26"
+              fill="none" stroke="rgba(255,248,210,0.16)" stroke-width="1.8" stroke-linecap="round"/>
+
+        <!-- ── SNAKE HEAD — at centre, mouth open left (biting tail) ─── -->
+        <!-- Head shadow/border -->
+        <ellipse cx="53" cy="26" rx="11" ry="7.5" fill="#1e1004"/>
+        <!-- Head base -->
+        <ellipse cx="53" cy="26" rx="10"  ry="6.5" fill="#9a7232"/>
+        <!-- Dorsal highlight (lighter top of skull) -->
+        <ellipse cx="52.5" cy="23.5" rx="7" ry="3.8" fill="#c8a96e" opacity="0.55"/>
+        <!-- Snout (slightly darker, projects left toward tail) -->
+        <ellipse cx="45" cy="26" rx="5.5" ry="4.2" fill="#7a5020"/>
+        <!-- Jaw gap line — mouth open to consume tail -->
+        <path d="M 47,23.2 C 44.5,24.2 41,25.5 41,26 C 41,26.5 44.5,27.8 47,28.8"
+              fill="none" stroke="#0f0602" stroke-width="1.4" stroke-linecap="round"/>
+
+        <!-- Eye — vertical slit pupil, snake-style -->
+        <circle cx="57" cy="22" r="3.2" fill="#0c0600"/>
+        <ellipse cx="57" cy="22" rx="1.4" ry="2.8" fill="#2a6018"/>
+        <ellipse cx="57" cy="22" rx="0.45" ry="2.5" fill="#040200"/>
+        <circle  cx="57.8" cy="20.7" r="0.75" fill="rgba(255,255,255,0.40)"/>
+
+        <!-- Tongue — forked, deep red -->
+        <line x1="42"  y1="26"   x2="37.5" y2="26"   stroke="#8a1010" stroke-width="1.3" stroke-linecap="round"/>
+        <line x1="37.5" y1="26"  x2="34.5" y2="23"   stroke="#8a1010" stroke-width="1.1" stroke-linecap="round"/>
+        <line x1="37.5" y1="26"  x2="34.5" y2="29"   stroke="#8a1010" stroke-width="1.1" stroke-linecap="round"/>
+      </svg>
+    </div>
     <div class="logo-divider"></div>
     <div class="logo-text">
       <div class="logo-title">Ethereal Capital</div>
@@ -569,8 +640,26 @@ HTML = r"""<!DOCTYPE html>
 </main>
 
 <footer>
-  <div class="footer-mark">∞</div>
-  <div class="footer-tagline">Enduring Wealth. Enduring Legacy.</div>
+  <div class="footer-mark">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 104 52" width="28" height="14" aria-hidden="true" style="opacity:0.35">
+      <defs>
+        <linearGradient id="sfg" x1="0" y1="0" x2="0" y2="52" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stop-color="#e8cc88"/><stop offset="100%" stop-color="#6e460e"/>
+        </linearGradient>
+      </defs>
+      <path d="M 52,26 C 52,46 34,51 21,51 C 5,51 1,39 1,26 C 1,13 5,1 21,1 C 34,1 52,6 52,26"
+            fill="none" stroke="#1e1004" stroke-width="11" stroke-linecap="round"/>
+      <path d="M 52,26 C 52,46 34,51 21,51 C 6,51 1,39 1,26 C 1,13 6,1 21,1 C 34,1 52,6 52,26"
+            fill="none" stroke="url(#sfg)" stroke-width="7.5" stroke-linecap="round"/>
+      <path d="M 52,26 C 52,6 70,1 83,1 C 99,1 103,13 103,26 C 103,39 99,51 83,51 C 70,51 52,46 52,26"
+            fill="none" stroke="#1e1004" stroke-width="11" stroke-linecap="round"/>
+      <path d="M 52,26 C 52,6 70,1 83,1 C 99,1 103,13 103,26 C 103,39 99,51 83,51 C 70,51 52,46 52,26"
+            fill="none" stroke="url(#sfg)" stroke-width="7.5" stroke-linecap="round"/>
+      <ellipse cx="53" cy="26" rx="10" ry="6.5" fill="#7a5020"/>
+      <ellipse cx="57" cy="22" rx="1.4" ry="2.8" fill="#2a6018"/>
+      <ellipse cx="57" cy="22" rx="0.45" ry="2.5" fill="#040200"/>
+    </svg>
+  </div>
 </footer>
 
 <script>

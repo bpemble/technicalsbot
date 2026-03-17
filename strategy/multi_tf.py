@@ -4,6 +4,7 @@
 
 import pandas as pd
 import numpy as np
+import config
 
 
 class MultiTFStrategy:
@@ -93,6 +94,7 @@ class MultiTFStrategy:
             & (rsi < 60)                             # not overbought
             & rsi_rising                             # momentum building
             & (merged["close"] > merged["ema_fast"]) # 4h price above EMA
+            & (merged["adx"] > config.ADX_TREND_THRESHOLD)
         )
 
         short_cond = (
@@ -101,6 +103,7 @@ class MultiTFStrategy:
             & (rsi > 40)                             # not oversold
             & rsi_falling                            # momentum weakening
             & (merged["close"] < merged["ema_fast"]) # 4h price below EMA
+            & (merged["adx"] > config.ADX_TREND_THRESHOLD)
         )
 
         # Avoid entering the same direction on consecutive bars
@@ -130,5 +133,4 @@ class MultiTFStrategy:
         out.loc[short_mask, "stop_loss"]   = close[short_mask] + atr[short_mask] * cfg.ATR_STOP_MULTIPLIER
         out.loc[short_mask, "take_profit"] = close[short_mask] - atr[short_mask] * cfg.ATR_TP_MULTIPLIER
 
-        # signals generated: {n_long} long, {n_short} short
         return out

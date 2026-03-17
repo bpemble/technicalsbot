@@ -9,12 +9,12 @@
 #   Later calls → incremental fetch only when a new candle has closed
 # ============================================================
 
-import sys
 import time
 import logging
 import requests
 import ccxt
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
@@ -190,6 +190,8 @@ class DataCache:
     def __init__(self):
         self._frames:     dict[tuple, pd.DataFrame] = {}
         self._last_fetch: dict[tuple, datetime]     = {}
+        self._ind_frames: dict[tuple, pd.DataFrame] = {}
+        self._ind_stale:  set[tuple]                = set()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -210,15 +212,23 @@ class DataCache:
 
         return self._frames[key]
 
-    def warm(self, assets: list, intervals_days: dict):
+    def get_with_indicators(self, hl_coin: str, interval: str, lookback_days: int, cfg) -> pd.DataFrame:
+        """Return cached indicator-enriched DataFrame; recomputes only when new bars arrive."""
+        key = (hl_coin, interval)
+        self.get(hl_coin, interval, lookback_days)
+        if key not in self._ind_frames or key in self._ind_stale:
+            from indicators.compute import add_indicators
+            self._ind_frames[key] = add_indicators(self._frames[key], cfg)
+            self._ind_stale.discard(key)
+        return self._ind_frames[key]
+
+    def warm(self, assets: list, intervals_days: dict, cfg=None):
         """
         Pre-fetch all assets × timeframes in parallel at startup.
 
         assets         : list of asset dicts from config.ASSETS
         intervals_days : {"15m": 3, "1h": 7, "4h": 120, "1d": 730}
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         jobs = [
             (asset["hl"], interval, days)
             for asset in assets
@@ -241,12 +251,25 @@ class DataCache:
                         f"  [red]✗[/red] {coin:6s} {iv:4s}  {exc}"
                     )
 
+        from rich.console import Console
+        _console = Console()
         for line in sorted(console_lines):
             try:
-                from rich.console import Console
-                Console().print(line)
+                _console.print(line)
             except Exception:
                 print(line)
+
+        if cfg is not None:
+            for asset in assets:
+                for interval in intervals_days:
+                    key = (asset["hl"], interval)
+                    if key in self._frames and key not in self._ind_frames:
+                        try:
+                            from indicators.compute import add_indicators
+                            self._ind_frames[key] = add_indicators(self._frames[key], cfg)
+                            self._ind_stale.discard(key)
+                        except Exception:
+                            pass
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -298,6 +321,7 @@ class DataCache:
 
         self._frames[key]     = df
         self._last_fetch[key] = datetime.now(tz=timezone.utc)
+        self._ind_stale.add(key)
 
     def _incremental_fetch(self, coin: str, interval: str, key: tuple):
         existing    = self._frames[key]
@@ -307,6 +331,7 @@ class DataCache:
             new_rows = new_df[new_df.index > existing.index[-1]]
             if not new_rows.empty:
                 self._frames[key] = pd.concat([existing, new_rows])
+                self._ind_stale.add(key)
                 logger.debug(f"Cache updated {coin} {interval}: +{len(new_rows)} bars")
         except Exception as exc:
             # Keep stale data rather than crash — next tick will retry
@@ -334,6 +359,14 @@ def fetch_ohlcv(symbol: str, timeframe: str, days: int) -> pd.DataFrame:
     Fetches from Kraken via ccxt (not cached).
     """
     return _fetch_kraken_candles(symbol, timeframe, days)
+
+
+def fetch_ohlcv_hl(hl_coin: str, interval: str, days: int) -> pd.DataFrame:
+    """Fetch OHLCV from Hyperliquid for the backtest. HL data matches live execution."""
+    since_ms = int(
+        (datetime.now(tz=timezone.utc) - timedelta(days=days)).timestamp() * 1000
+    )
+    return fetch_hl_candles(hl_coin, interval, since_ms)
 
 
 def fetch_latest_prices() -> dict[str, float]:
@@ -370,3 +403,47 @@ def fetch_funding_rates() -> dict[str, float]:
     except Exception as exc:
         logger.warning(f"Funding rate fetch failed: {exc}")
         return {}
+
+
+def fetch_funding_and_oi() -> tuple[dict, dict]:
+    """
+    Fetch predicted hourly funding rates AND open interest from Hyperliquid in one call.
+
+    Returns (funding_rates, oi_values) where both are {hl_name: float}.
+    oi_values units are the coin's native token (same as HL UI).
+    Falls back to ({}, {}) on failure.
+    """
+    try:
+        resp = _hl_session.post(
+            HL_API, json={"type": "metaAndAssetCtxs"}, timeout=HL_TIMEOUT
+        )
+        resp.raise_for_status()
+        meta, ctxs = resp.json()
+        funding: dict[str, float] = {}
+        oi:      dict[str, float] = {}
+        for asset, ctx in zip(meta["universe"], ctxs):
+            name          = asset["name"]
+            funding[name] = float(ctx.get("funding",      0.0))
+            oi[name]      = float(ctx.get("openInterest", 0.0))
+        return funding, oi
+    except Exception as exc:
+        logger.warning(f"Funding/OI fetch failed: {exc}")
+        return {}, {}
+
+
+def fetch_fear_and_greed() -> int:
+    """
+    Fetch the current Fear & Greed Index (0–100) from alternative.me.
+
+    Returns the integer value, or -1 if the request fails.
+    Uses a separate requests call (not the HL session) since it hits an external API.
+    """
+    try:
+        resp = requests.get(
+            "https://api.alternative.me/fng/?limit=1", timeout=5
+        )
+        resp.raise_for_status()
+        return int(resp.json()["data"][0]["value"])
+    except Exception as exc:
+        logger.warning(f"Fear & Greed fetch failed: {exc}")
+        return -1

@@ -88,6 +88,9 @@ class BacktestEngine:
         fees_paid_entry   = 0.0
         funding_accrued   = 0.0
         candles_in_trade  = 0
+        trail_active      = False
+        trail_stop        = 0.0
+        entry_atr         = 0.0
 
         timestamps = list(signals_df.index)
         n          = len(timestamps)
@@ -106,6 +109,23 @@ class BacktestEngine:
                 candles_in_trade += 1
                 notional_now = position_size * candle_open
 
+                # ---- Update trailing stop --------------------------------
+                if entry_atr > 0:
+                    activation_dist = entry_atr * cfg.TRAIL_ACTIVATION_ATR
+                    trail_dist      = entry_atr * cfg.TRAIL_ATR_MULTIPLIER
+                    if direction == "long":
+                        if candle_high - entry_price >= activation_dist:
+                            candidate = candle_high - trail_dist
+                            if not trail_active or candidate > trail_stop:
+                                trail_active = True
+                                trail_stop   = candidate
+                    else:
+                        if entry_price - candle_low >= activation_dist:
+                            candidate = candle_low + trail_dist
+                            if not trail_active or candidate < trail_stop:
+                                trail_active = True
+                                trail_stop   = candidate
+
                 # Funding: charged every 2 candles on 4h data (= 8h funding period)
                 if candles_in_trade % 2 == 0:
                     funding_charge = notional_now * (cfg.FUNDING_RATE_DAILY / 3)
@@ -115,11 +135,16 @@ class BacktestEngine:
                 stop_hit = False
                 tp_hit   = False
 
+                effective_stop = stop_loss
+                if trail_active:
+                    effective_stop = (max(stop_loss, trail_stop) if direction == "long"
+                                     else min(stop_loss, trail_stop))
+
                 if direction == "long":
-                    stop_hit = candle_low  <= stop_loss
+                    stop_hit = candle_low  <= effective_stop
                     tp_hit   = candle_high >= take_profit
                 else:  # short
-                    stop_hit = candle_high >= stop_loss
+                    stop_hit = candle_high >= effective_stop
                     tp_hit   = candle_low  <= take_profit
 
                 # If both can be hit → conservative: assume stop first
@@ -130,8 +155,8 @@ class BacktestEngine:
                 exit_price  = None
 
                 if stop_hit:
-                    exit_price  = stop_loss
-                    exit_reason = "stop_loss"
+                    exit_price  = effective_stop
+                    exit_reason = "trail_stop" if trail_active else "stop_loss"
                 elif tp_hit:
                     exit_price  = take_profit
                     exit_reason = "take_profit"
@@ -155,6 +180,9 @@ class BacktestEngine:
                     direction        = None
                     candles_in_trade = 0
                     funding_accrued  = 0.0
+                    trail_active     = False
+                    trail_stop       = 0.0
+                    entry_atr        = 0.0
 
             # ---- 2. Check for new signal (fills on NEXT candle open) --
             #    Signal on candle[i-1] → entry on candle[i].open
@@ -182,6 +210,9 @@ class BacktestEngine:
                         direction        = None
                         candles_in_trade = 0
                         funding_accrued  = 0.0
+                        trail_active     = False
+                        trail_stop       = 0.0
+                        entry_atr        = 0.0
 
                 if not in_position and prev_signal != 0 and prev_sl is not None:
                     # Enter new position at this candle's open
@@ -234,6 +265,9 @@ class BacktestEngine:
                     entry_time       = ts
                     candles_in_trade = 0
                     funding_accrued  = 0.0
+                    entry_atr        = prev_atr if prev_atr is not None else 0.0
+                    trail_active     = False
+                    trail_stop       = 0.0
 
             # ---- 3. Record equity at this timestamp ------------------
             if in_position:
@@ -258,6 +292,9 @@ class BacktestEngine:
             capital += trade["pnl"]
             trades.append(trade)
             equity_curve[last_ts] = capital
+            trail_active = False
+            trail_stop   = 0.0
+            entry_atr    = 0.0
 
         equity_series = pd.Series(equity_curve)
         equity_series.index = pd.to_datetime(equity_series.index, utc=True)

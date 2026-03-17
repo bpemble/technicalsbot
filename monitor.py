@@ -167,6 +167,7 @@ def main():
 
         reason_colors = {
             "hard_stop":      "red",
+            "trail_stop":     "yellow",
             "stop_loss":      "red",
             "take_profit":    "green",
             "regime_flip":    "yellow",

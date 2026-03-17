@@ -1,13 +1,23 @@
-"""
-Regime strategy backtester.
-Usage: python -m backtest.regime_backtest
+# ============================================================
+# backtest/regime_backtest.py — Regime strategy backtester
+#
+# Two public surfaces:
+#
+#   simulate(df_1d, df_4h, df_1h, df_15m, cfg) -> dict
+#       Pure simulation on pre-fetched, pre-indicator DataFrames.
+#       Used by both main.py and optimize.py so the logic is DRY.
+#
+#   run(coin, verbose) -> dict
+#       Full pipeline: fetch → indicators → simulate → report.
+#       Called by main.py.
+# ============================================================
 
-Fetches historical data, computes regime scores bar-by-bar (no lookahead),
-simulates always-in positioning, and reports performance metrics.
-"""
 import sys
-import pandas as pd
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
 import numpy as np
+import pandas as pd
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -21,469 +31,537 @@ from indicators.compute import add_indicators
 from strategy.regime import RegimeEngine
 from backtest.metrics import compute_metrics
 
-# ETH on Hyperliquid (full paginated history — used instead of Kraken)
-_BT_COIN = "ETH"
-
-def _fetch(interval: str, days: int) -> pd.DataFrame:
-    """Fetch from Hyperliquid with proper pagination for full history."""
-    from datetime import datetime, timedelta, timezone
-    since_ms = int(
-        (datetime.now(tz=timezone.utc) - timedelta(days=days)).timestamp() * 1000
-    )
-    return fetch_hl_candles(_BT_COIN, interval, since_ms)
-
 console = Console()
 
-HARD_STOP_PCT = 0.08
+HARD_STOP_PCT   = 0.08   # hard cap on ATR-based stop (matches always_in_runner)
+MAX_NOTIONAL_X  = 2.0    # max position = 2× current equity (single-asset)
+WARMUP_BARS_4H  = 80     # bars before we start scoring (indicator warmup)
 
 
-def run_regime_backtest():
+# ── Sizing helpers (mirror live/always_in_runner without imports) ─────────────
+
+def _vol_size_factor_bt(snap, cfg) -> float:
+    """Reduce size in low-vol regimes (mirrors _vol_size_factor in always_in_runner)."""
+    pct  = snap.norm_atr_pct
+    low  = getattr(cfg, "VOL_REGIME_LOW",  0.70)
+    minf = getattr(cfg, "VOL_REGIME_MIN",  0.60)
+    if pct <= 0 or (isinstance(pct, float) and np.isnan(pct)):
+        return 1.0
+    if pct >= low:
+        return 1.0
+    return minf + (1.0 - minf) * (pct / low)
+
+
+def _ma200_size_factor_bt(snap, cfg) -> float:
+    """Penalise size when price is stretched far from MA200 (mirrors always_in_runner)."""
+    dist = abs(snap.ma200_dist)
+    near = getattr(cfg, "MA200_NEAR_BAND", 0.15)
+    far  = getattr(cfg, "MA200_FAR_BAND",  0.35)
+    if dist <= 0 or (isinstance(dist, float) and np.isnan(dist)):
+        return 1.0
+    if dist <= near:
+        return 1.0
+    if dist >= far:
+        return 0.5
+    frac = (dist - near) / (far - near)
+    return 1.0 - 0.5 * frac
+
+
+# ── Pure simulation ───────────────────────────────────────────────────────────
+
+def simulate(
+    df_1d:  pd.DataFrame,
+    df_4h:  pd.DataFrame,
+    df_1h:  pd.DataFrame,
+    df_15m: pd.DataFrame,
+    cfg,
+    initial_capital: float = None,
+) -> dict:
     """
-    Bar-by-bar backtest of the RegimeEngine always-in strategy.
+    Bar-by-bar regime backtest on pre-computed indicator DataFrames.
 
-    Uses 4h bars as the entry/exit timeframe. For each 4h bar, slices all
-    timeframes to data up to that point (no lookahead bias), computes the
-    regime score, and manages a single position with conviction-weighted
-    sizing and an 8% hard stop.
+    Matches the live always_in_runner logic:
+      - Regime score drives direction (long/short/flat).
+      - Kelly sizing scaled by conviction, capped at MAX_NOTIONAL_X × equity.
+      - ATR-based stop, capped at HARD_STOP_PCT.
+      - Trailing stop activated after TRAIL_ACTIVATION_ATR gain.
+      - Exits: hard/trail stop, regime flip, regime flat.
+
+    All DataFrames must have indicators already applied (add_indicators).
+    Returns the same dict shape as BacktestEngine.run().
     """
-    console.print()
-    console.print(Panel(
-        "[bold cyan]Regime Strategy Backtester[/bold cyan]\n"
-        "[dim]Always-in conviction-weighted positioning — no lookahead[/dim]\n"
-        f"[dim]Symbol: {config.SYMBOL}  |  Entry TF: 4h  |  Trend TF: 1d[/dim]",
-        expand=False,
-        border_style="cyan",
-    ))
-    console.print()
+    if initial_capital is None:
+        initial_capital = getattr(cfg, "PAPER_CAPITAL", 10_000.0)
 
-    # ----------------------------------------------------------------
-    # Step 1: Fetch data
-    # ----------------------------------------------------------------
-    console.print("[bold]Step 1 / 4 — Fetching historical data…[/bold]")
+    engine    = RegimeEngine(cfg)
+    capital   = initial_capital
+    trades:   list[dict] = []
+    eq_curve: dict = {}
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TimeElapsedColumn(),
-        console=console,
-        transient=True,
-    ) as progress:
-        t_1d = progress.add_task("Daily bars…", total=None)
+    pos: Optional[dict] = None  # current open position
+
+    for i in range(WARMUP_BARS_4H, len(df_4h)):
+        ts    = df_4h.index[i]
+        row4h = df_4h.iloc[i]
+
+        c_open  = float(row4h["open"])
+        c_high  = float(row4h["high"])
+        c_low   = float(row4h["low"])
+        c_close = float(row4h["close"])
+
+        # ── Slice all frames to bars up to ts (no lookahead) ──────────
+        d1d  = df_1d[df_1d.index   <= ts]
+        d4h  = df_4h.iloc[:i + 1]
+        d1h  = df_1h[df_1h.index   <= ts] if not df_1h.empty  else df_1h
+        d15m = df_15m[df_15m.index <= ts] if not df_15m.empty else df_15m
+
+        if d1d.empty or d4h.empty:
+            eq_curve[ts] = capital
+            continue
+
+        # ── Regime score ───────────────────────────────────────────────
         try:
-            df_1d_raw = _fetch("1d", config.LOOKBACK_DAYS)
-        except Exception as exc:
-            console.print(f"[red]Failed to fetch daily data: {exc}[/red]")
-            sys.exit(1)
-        progress.update(t_1d, description=f"[green]Daily: {len(df_1d_raw)} bars[/green]", completed=True)
+            snap = engine.compute(d1d, d4h, d1h, d15m)
+        except Exception:
+            eq_curve[ts] = capital
+            continue
 
-        t_4h = progress.add_task("4h bars…", total=None)
-        try:
-            df_4h_raw = _fetch("4h", config.LOOKBACK_DAYS)
-        except Exception as exc:
-            console.print(f"[red]Failed to fetch 4h data: {exc}[/red]")
-            sys.exit(1)
-        progress.update(t_4h, description=f"[green]4h: {len(df_4h_raw)} bars[/green]", completed=True)
+        score = snap.score
+        price = float(c_close) if snap.latest_price <= 0 else snap.latest_price
+        atr   = snap.latest_atr
 
-        t_1h = progress.add_task("1h bars…", total=None)
-        try:
-            df_1h_raw = _fetch("1h", 730)
-        except Exception as exc:
-            console.print(f"[yellow]1h fetch failed ({exc}), using empty frame[/yellow]")
-            df_1h_raw = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-        progress.update(t_1h, description=f"[green]1h: {len(df_1h_raw)} bars[/green]", completed=True)
+        if price <= 0:
+            eq_curve[ts] = capital
+            continue
 
-        t_15m = progress.add_task("15m bars…", total=None)
-        try:
-            df_15m_raw = _fetch("15m", config.SCALP_LOOKBACK_DAYS)
-        except Exception as exc:
-            console.print(f"[yellow]15m fetch failed ({exc}), using empty frame[/yellow]")
-            df_15m_raw = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-        progress.update(t_15m, description=f"[green]15m: {len(df_15m_raw)} bars[/green]", completed=True)
-
-    console.print(
-        f"  Daily: [green]{len(df_1d_raw):,}[/green] bars  |  "
-        f"4h: [green]{len(df_4h_raw):,}[/green] bars  |  "
-        f"1h: [green]{len(df_1h_raw):,}[/green] bars  |  "
-        f"15m: [green]{len(df_15m_raw):,}[/green] bars"
-    )
-    console.print()
-
-    # ----------------------------------------------------------------
-    # Step 2: Compute indicators on full history (then slice per bar)
-    # ----------------------------------------------------------------
-    console.print("[bold]Step 2 / 4 — Computing indicators on full history…[/bold]")
-
-    df_1d_ind  = add_indicators(df_1d_raw,  config) if not df_1d_raw.empty  else df_1d_raw
-    df_4h_ind  = add_indicators(df_4h_raw,  config) if not df_4h_raw.empty  else df_4h_raw
-    df_1h_ind  = add_indicators(df_1h_raw,  config) if not df_1h_raw.empty  else df_1h_raw
-    df_15m_ind = add_indicators(df_15m_raw, config) if not df_15m_raw.empty else df_15m_raw
-
-    console.print("  [green]Done.[/green]")
-    console.print()
-
-    # ----------------------------------------------------------------
-    # Step 3: Bar-by-bar simulation
-    # ----------------------------------------------------------------
-    console.print("[bold]Step 3 / 4 — Running bar-by-bar regime simulation…[/bold]")
-    console.print(f"  [dim]Processing {len(df_4h_ind)} 4h bars — this may take a moment…[/dim]")
-
-    engine = RegimeEngine(config)
-
-    # Simulation state
-    capital       = config.PAPER_CAPITAL
-    initial_cap   = config.PAPER_CAPITAL
-    equity_curve  = {}
-    trades        = []
-
-    in_position   = False
-    direction     = None        # 'long' or 'short'
-    entry_price   = 0.0
-    entry_time    = None
-    position_size = 0.0         # asset units
-    stop_price    = 0.0
-    fees_entry    = 0.0
-    funding_acc   = 0.0
-    candles_held  = 0
-
-    bars_4h = list(df_4h_ind.index)
-    n_bars  = len(bars_4h)
-
-    # Minimum bars needed for indicators to warm up before we start trading
-    WARMUP_BARS = 60
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TimeElapsedColumn(),
-        console=console,
-        transient=True,
-    ) as progress:
-        sim_task = progress.add_task("Simulating…", total=n_bars)
-
-        for i, ts in enumerate(bars_4h):
-            progress.advance(sim_task)
-
-            bar = df_4h_ind.loc[ts]
-            candle_open  = float(bar["open"])
-            candle_high  = float(bar["high"])
-            candle_low   = float(bar["low"])
-            candle_close = float(bar["close"])
-
-            # ---- Manage open position --------------------------------
-            if in_position:
-                candles_held += 1
-                notional_now = position_size * candle_open
-
-                # Funding every 2 candles on 4h data (= 8h period)
-                if candles_held % 2 == 0:
-                    funding_charge = notional_now * (config.FUNDING_RATE_DAILY / 3)
-                    funding_acc   += funding_charge
-
-                # Hard stop check
-                stop_hit = False
-                if direction == "long" and candle_low <= stop_price:
-                    stop_hit = True
-                elif direction == "short" and candle_high >= stop_price:
-                    stop_hit = True
-
-                if stop_hit:
-                    exit_p = stop_price
-                    exit_fee = position_size * exit_p * config.EXCHANGE_FEE
-                    if direction == "long":
-                        gross = (exit_p - entry_price) * position_size
-                    else:
-                        gross = (entry_price - exit_p) * position_size
-                    net = gross - exit_fee - funding_acc
-                    capital += gross - exit_fee
-                    trades.append({
-                        "entry_time":     entry_time,
-                        "exit_time":      ts,
-                        "direction":      direction,
-                        "entry_price":    entry_price,
-                        "exit_price":     exit_p,
-                        "size":           position_size,
-                        "pnl":            net,
-                        "pnl_pct":        (net / (capital - net)) * 100 if (capital - net) > 0 else 0.0,
-                        "exit_reason":    "hard_stop",
-                        "fees_paid":      fees_entry + exit_fee,
-                        "funding_paid":   funding_acc,
-                        "duration_hours": (pd.Timestamp(ts) - pd.Timestamp(entry_time)).total_seconds() / 3600 if entry_time else 0.0,
-                    })
-                    in_position  = False
-                    direction    = None
-                    candles_held = 0
-                    funding_acc  = 0.0
-                    equity_curve[ts] = capital
-                    continue
-
-            # ---- Compute regime (no lookahead: slice to current bar) -----
-            if i < WARMUP_BARS:
-                equity_curve[ts] = capital
-                continue
-
-            # Slice each timeframe to timestamps <= current 4h bar's ts
-            slice_1d  = df_1d_ind[df_1d_ind.index <= ts]
-            slice_4h  = df_4h_ind.iloc[:i + 1]
-            slice_1h  = df_1h_ind[df_1h_ind.index <= ts]  if not df_1h_ind.empty  else df_1h_ind
-            slice_15m = df_15m_ind[df_15m_ind.index <= ts] if not df_15m_ind.empty else df_15m_ind
-
-            if slice_1d.empty or slice_4h.empty:
-                equity_curve[ts] = capital
-                continue
-
-            try:
-                snapshot = engine.compute(slice_1d, slice_4h, slice_1h, slice_15m)
-            except Exception:
-                equity_curve[ts] = capital
-                continue
-
-            target_dir = snapshot.direction
-            score      = snapshot.score
-
-            # ---- Position management ---------------------------------
-            if in_position:
-                # Flip or close if regime changes
-                if target_dir == "flat" or (target_dir != direction):
-                    exit_p   = candle_close
-                    exit_fee = position_size * exit_p * config.EXCHANGE_FEE
-                    if direction == "long":
-                        gross = (exit_p - entry_price) * position_size
-                    else:
-                        gross = (entry_price - exit_p) * position_size
-                    net = gross - exit_fee - funding_acc
-                    capital += gross - exit_fee
-                    trades.append({
-                        "entry_time":     entry_time,
-                        "exit_time":      ts,
-                        "direction":      direction,
-                        "entry_price":    entry_price,
-                        "exit_price":     exit_p,
-                        "size":           position_size,
-                        "pnl":            net,
-                        "pnl_pct":        (net / (capital - net)) * 100 if (capital - net) > 0 else 0.0,
-                        "exit_reason":    "regime_flip" if target_dir != "flat" else "regime_flat",
-                        "fees_paid":      fees_entry + exit_fee,
-                        "funding_paid":   funding_acc,
-                        "duration_hours": (pd.Timestamp(ts) - pd.Timestamp(entry_time)).total_seconds() / 3600 if entry_time else 0.0,
-                    })
-                    in_position  = False
-                    direction    = None
-                    candles_held = 0
-                    funding_acc  = 0.0
-
-                    if target_dir == "flat":
-                        equity_curve[ts] = capital
-                        continue
+        # ── Manage open position ───────────────────────────────────────
+        if pos is not None:
+            # Update trailing stop from this candle's intraday range
+            t_atr = pos["trail_atr"]
+            if t_atr > 0:
+                act  = t_atr * cfg.TRAIL_ACTIVATION_ATR
+                dist = t_atr * cfg.TRAIL_ATR_MULTIPLIER
+                if pos["direction"] == "long":
+                    if c_high - pos["entry_price"] >= act:
+                        cand = c_high - dist
+                        if pos["trailing_stop"] is None or cand > pos["trailing_stop"]:
+                            pos["trailing_stop"] = cand
                 else:
-                    # Same direction — mark to market
-                    if direction == "long":
-                        unrealised = (candle_close - entry_price) * position_size
-                    else:
-                        unrealised = (entry_price - candle_close) * position_size
-                    equity_curve[ts] = capital + unrealised - funding_acc
-                    continue
+                    if pos["entry_price"] - c_low >= act:
+                        cand = c_low + dist
+                        if pos["trailing_stop"] is None or cand < pos["trailing_stop"]:
+                            pos["trailing_stop"] = cand
 
-            # ---- Open new position -----------------------------------
-            if target_dir in ("long", "short") and abs(score) > config.MIN_CONVICTION_SCORE:
-                conviction = abs(score) / 100.0
-                notional   = capital * config.LEVERAGE * conviction
-                fill       = candle_close * (
-                    1 + config.SLIPPAGE if target_dir == "long" else 1 - config.SLIPPAGE
+            # Effective stop = tighter of hard or trail
+            eff_stop = pos["stop_loss"]
+            if pos["trailing_stop"] is not None:
+                eff_stop = (
+                    max(eff_stop, pos["trailing_stop"]) if pos["direction"] == "long"
+                    else min(eff_stop, pos["trailing_stop"])
                 )
-                if fill <= 0:
-                    equity_curve[ts] = capital
-                    continue
 
-                size = notional / fill
-                if size <= 0:
-                    equity_curve[ts] = capital
-                    continue
+            stop_hit = (
+                (pos["direction"] == "long"  and c_low  <= eff_stop) or
+                (pos["direction"] == "short" and c_high >= eff_stop)
+            )
+            if stop_hit:
+                reason = "trail_stop" if pos["trailing_stop"] is not None else "hard_stop"
+                trade  = _close(pos, eff_stop, reason, ts, cfg, capital)
+                capital += trade["pnl"]
+                trades.append(trade)
+                pos = None
 
-                fee = size * fill * config.EXCHANGE_FEE
-                capital -= fee
-
-                stop_price    = fill * (1 - HARD_STOP_PCT) if target_dir == "long" else fill * (1 + HARD_STOP_PCT)
-                in_position   = True
-                direction     = target_dir
-                entry_price   = fill
-                entry_time    = ts
-                position_size = size
-                fees_entry    = fee
-                funding_acc   = 0.0
-                candles_held  = 0
-
-            if in_position:
-                if direction == "long":
-                    unrealised = (candle_close - entry_price) * position_size
-                else:
-                    unrealised = (entry_price - candle_close) * position_size
-                equity_curve[ts] = capital + unrealised - funding_acc
-            else:
-                equity_curve[ts] = capital
-
-        progress.update(sim_task, completed=n_bars)
-
-    # Close any open position at end of data
-    if in_position:
-        last_ts    = bars_4h[-1]
-        last_close = float(df_4h_ind.loc[last_ts, "close"])
-        exit_fee   = position_size * last_close * config.EXCHANGE_FEE
-        if direction == "long":
-            gross = (last_close - entry_price) * position_size
+        # ── Target direction ───────────────────────────────────────────
+        if score > cfg.MIN_CONVICTION_SCORE:
+            target = "long"
+        elif score < -cfg.MIN_CONVICTION_SCORE:
+            target = "short"
         else:
-            gross = (entry_price - last_close) * position_size
-        net = gross - exit_fee - funding_acc
-        capital += gross - exit_fee
-        trades.append({
-            "entry_time":     entry_time,
-            "exit_time":      last_ts,
-            "direction":      direction,
-            "entry_price":    entry_price,
-            "exit_price":     last_close,
-            "size":           position_size,
-            "pnl":            net,
-            "pnl_pct":        (net / (capital - net)) * 100 if (capital - net) > 0 else 0.0,
-            "exit_reason":    "end_of_data",
-            "fees_paid":      fees_entry + exit_fee,
-            "funding_paid":   funding_acc,
-            "duration_hours": (pd.Timestamp(last_ts) - pd.Timestamp(entry_time)).total_seconds() / 3600 if entry_time else 0.0,
-        })
-        equity_curve[last_ts] = capital
+            target = "flat"
 
-    console.print(f"  Simulation complete — [bold]{len(trades)}[/bold] trades executed.")
-    console.print()
+        # ── Close on regime flip / flat ────────────────────────────────
+        if pos is not None and pos["direction"] != target:
+            trade   = _close(pos, price, "regime_exit", ts, cfg, capital)
+            capital += trade["pnl"]
+            trades.append(trade)
+            pos = None
 
-    # ----------------------------------------------------------------
-    # Step 4: Metrics & report
-    # ----------------------------------------------------------------
-    console.print("[bold]Step 4 / 4 — Computing metrics…[/bold]")
+        # ── Open new position ──────────────────────────────────────────
+        if pos is None and target != "flat":
+            slip = cfg.SLIPPAGE if target == "long" else -cfg.SLIPPAGE
+            fill = price * (1 + slip)
 
-    equity_series = pd.Series(equity_curve)
-    equity_series.index = pd.to_datetime(equity_series.index, utc=True)
-    equity_series.sort_index(inplace=True)
+            stop_dist = (
+                min(atr * cfg.ATR_STOP_MULTIPLIER, fill * HARD_STOP_PCT)
+                if atr > 0 else fill * HARD_STOP_PCT
+            )
 
-    metrics = compute_metrics(trades, equity_series, initial_cap)
+            conviction = abs(score) / 100.0
+            notional   = capital * cfg.KELLY_FRACTION * conviction / HARD_STOP_PCT
+            notional   = min(notional, capital * MAX_NOTIONAL_X)
 
+            # Vol regime and MA200 size factors (same logic as live runner)
+            notional  *= _vol_size_factor_bt(snap, cfg)
+            notional  *= _ma200_size_factor_bt(snap, cfg)
+
+            size       = notional / fill if fill > 0 else 0.0
+
+            if size <= 0:
+                eq_curve[ts] = capital
+                continue
+
+            fee      = size * fill * cfg.EXCHANGE_FEE
+            capital -= fee
+
+            pos = {
+                "direction":    target,
+                "entry_price":  fill,
+                "entry_time":   ts,
+                "size":         size,
+                "stop_loss":    (fill - stop_dist) if target == "long" else (fill + stop_dist),
+                "trail_atr":    atr,
+                "trailing_stop": None,
+                "entry_fee":    fee,
+            }
+
+        # ── Mark to market ─────────────────────────────────────────────
+        if pos is not None:
+            upnl = (
+                (price - pos["entry_price"]) * pos["size"]
+                if pos["direction"] == "long"
+                else (pos["entry_price"] - price) * pos["size"]
+            )
+            eq_curve[ts] = capital + upnl
+        else:
+            eq_curve[ts] = capital
+
+    # Close any still-open position at last bar
+    if pos is not None and len(df_4h) > 0:
+        last_ts    = df_4h.index[-1]
+        last_close = float(df_4h.iloc[-1]["close"])
+        trade      = _close(pos, last_close, "end_of_data", last_ts, cfg, capital)
+        capital   += trade["pnl"]
+        trades.append(trade)
+        eq_curve[last_ts] = capital
+
+    eq_series = pd.Series(eq_curve)
+    eq_series.index = pd.to_datetime(eq_series.index, utc=True)
+    eq_series.sort_index(inplace=True)
+
+    return {
+        "trades":        trades,
+        "equity_curve":  eq_series,
+        "final_capital": capital,
+    }
+
+
+def _close(pos: dict, exit_price: float, reason: str, ts, cfg, capital: float) -> dict:
+    size     = pos["size"]
+    fee_exit = size * exit_price * cfg.EXCHANGE_FEE
+    gross    = (
+        (exit_price - pos["entry_price"]) * size if pos["direction"] == "long"
+        else (pos["entry_price"] - exit_price) * size
+    )
+    net_pnl  = gross - fee_exit
+    pnl_pct  = (net_pnl / capital * 100) if capital > 0 else 0.0
+    try:
+        dur_h = (pd.Timestamp(ts) - pd.Timestamp(pos["entry_time"])).total_seconds() / 3600
+    except Exception:
+        dur_h = 0.0
+    return {
+        "entry_time":     pos["entry_time"],
+        "exit_time":      ts,
+        "direction":      pos["direction"],
+        "entry_price":    pos["entry_price"],
+        "exit_price":     exit_price,
+        "size":           size,
+        "pnl":            net_pnl,
+        "pnl_pct":        pnl_pct,
+        "exit_reason":    reason,
+        "fees_paid":      pos.get("entry_fee", 0.0) + fee_exit,
+        "funding_paid":   0.0,
+        "duration_hours": dur_h,
+    }
+
+
+# ── Full pipeline (fetch → indicators → simulate → report) ───────────────────
+
+def run(coin: str = None, verbose: bool = True) -> dict:
+    """
+    Fetch data, compute indicators, simulate, and print a full report.
+    Returns the results dict from simulate().
+    """
+    if coin is None:
+        coin = getattr(config, "BACKTEST_COIN", "ETH")
+
+    if verbose:
+        console.print()
+        console.print(Panel(
+            "[bold cyan]Regime Strategy Backtester[/bold cyan]\n"
+            "[dim]Always-in conviction-weighted positioning — ATR stops + trailing stops[/dim]\n"
+            f"[dim]Asset: {coin}  |  Entry TF: 4h  |  Trend TF: 1d  |  "
+            f"Lookback: {config.LOOKBACK_DAYS} days[/dim]",
+            border_style="cyan", expand=False,
+        ))
+        console.print()
+
+    # ── Step 1: Fetch ─────────────────────────────────────────────────
+    if verbose:
+        console.print("[bold]Step 1 / 4 — Fetching historical data…[/bold]")
+
+    def _fetch(interval: str, days: int) -> pd.DataFrame:
+        since_ms = int(
+            (datetime.now(tz=timezone.utc) - timedelta(days=days)).timestamp() * 1000
+        )
+        return fetch_hl_candles(coin, interval, since_ms)
+
+    with Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                  BarColumn(), TimeElapsedColumn(),
+                  console=console, transient=True) as prog:
+
+        def fetch_tf(interval, days, label):
+            t = prog.add_task(f"Fetching {label}…", total=None)
+            try:
+                df = _fetch(interval, days)
+            except Exception as exc:
+                console.print(f"[yellow]{label} fetch failed ({exc}), using empty frame[/yellow]")
+                df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+            prog.update(t, description=f"[green]{label}: {len(df):,} bars[/green]", completed=True)
+            return df
+
+        df_1d_raw  = fetch_tf("1d",  config.LOOKBACK_DAYS, "Daily")
+        df_4h_raw  = fetch_tf("4h",  config.LOOKBACK_DAYS, "4h")
+        # HL 1h history is typically ~90 days; try full lookback, fall back to 90d
+        df_1h_raw  = fetch_tf("1h",  config.LOOKBACK_DAYS, "1h")
+        if df_1h_raw.empty:
+            df_1h_raw = fetch_tf("1h", 90, "1h (90d fallback)")
+        df_15m_raw = fetch_tf("15m", min(config.LOOKBACK_DAYS, 60), "15m")
+
+    if verbose:
+        console.print(
+            f"  [green]Daily:[/green] {len(df_1d_raw):,} bars  "
+            f"({df_1d_raw.index[0].date() if not df_1d_raw.empty else '?'} → "
+            f"{df_1d_raw.index[-1].date() if not df_1d_raw.empty else '?'})\n"
+            f"  [green]4h:[/green]    {len(df_4h_raw):,} bars  |  "
+            f"[green]1h:[/green] {len(df_1h_raw):,} bars  |  "
+            f"[green]15m:[/green] {len(df_15m_raw):,} bars"
+        )
+        console.print()
+
+    # ── Step 2: Indicators ────────────────────────────────────────────
+    if verbose:
+        console.print("[bold]Step 2 / 4 — Computing indicators…[/bold]")
+
+    def ind(df):
+        return add_indicators(df, config) if not df.empty else df
+
+    df_1d  = ind(df_1d_raw)
+    df_4h  = ind(df_4h_raw)
+    df_1h  = ind(df_1h_raw)
+    df_15m = ind(df_15m_raw)
+
+    if verbose:
+        console.print("  [green]Done.[/green]")
+        console.print()
+
+    # ── Step 3: Simulate ──────────────────────────────────────────────
+    if verbose:
+        console.print("[bold]Step 3 / 4 — Running bar-by-bar simulation…[/bold]")
+        console.print(f"  [dim]{len(df_4h):,} 4h bars to process…[/dim]")
+
+    with Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                  BarColumn(), TextColumn("{task.percentage:>3.0f}%"),
+                  TimeElapsedColumn(), console=console, transient=True) as prog:
+
+        task = prog.add_task("Simulating…", total=len(df_4h) - WARMUP_BARS_4H)
+
+        # Wrap simulate() with a progress hook by monkey-patching isn't clean —
+        # instead, run it and just show a spinner (it's fast enough, ~10-30s).
+        prog.update(task, description="Simulating…")
+        results = simulate(df_1d, df_4h, df_1h, df_15m, config)
+        prog.update(task, completed=len(df_4h) - WARMUP_BARS_4H)
+
+    trades      = results["trades"]
+    equity      = results["equity_curve"]
+    final_cap   = results["final_capital"]
+
+    if verbose:
+        console.print(f"  [green]Done.[/green]  {len(trades)} trades executed.")
+        console.print()
+
+    # ── Step 4: Report ────────────────────────────────────────────────
+    if verbose:
+        console.print("[bold]Step 4 / 4 — Computing metrics…[/bold]")
+        console.print()
+
+    metrics = compute_metrics(trades, equity, config.PAPER_CAPITAL)
+
+    if verbose:
+        _print_report(metrics, trades, equity, coin)
+
+    return results
+
+
+# ── Reporting helpers ─────────────────────────────────────────────────────────
+
+def _print_report(metrics: dict, trades: list, equity: pd.Series, coin: str):
     console.rule("[bold cyan]Regime Backtest — Performance Report[/bold cyan]")
     console.print()
 
-    # Metrics table
-    table = Table(
-        title="Regime Strategy Performance Metrics",
-        box=box.DOUBLE_EDGE,
-        title_style="bold cyan",
-        show_header=True,
-        header_style="bold magenta",
-        expand=False,
-        min_width=55,
+    # ── Metrics table ──────────────────────────────────────────────────
+    tbl = Table(
+        title=f"Regime Strategy Performance — {coin}",
+        box=box.DOUBLE_EDGE, title_style="bold cyan",
+        show_header=True, header_style="bold magenta",
+        expand=False, min_width=55,
     )
-    table.add_column("Metric", style="bold", justify="left", min_width=28)
-    table.add_column("Value",  justify="right", min_width=18)
+    tbl.add_column("Metric", style="bold", justify="left",  min_width=28)
+    tbl.add_column("Value",                justify="right", min_width=18)
 
-    def row(label, val_str):
-        table.add_row(label, val_str)
+    def row(label, val):
+        tbl.add_row(label, val)
 
+    ic  = metrics["initial_capital"]
+    fc  = metrics["final_capital"]
+    tr  = metrics["total_return"]
+    ar  = metrics["annualized_return"]
+    mdd = metrics["max_drawdown"]
+    sh  = metrics["sharpe_ratio"]
+    so  = metrics["sortino_ratio"]
     pf  = metrics["profit_factor"]
     pf_str = "∞" if pf == float("inf") else f"{pf:.3f}"
 
-    cap_init  = metrics["initial_capital"]
-    cap_final = metrics["final_capital"]
-    tot_ret   = metrics["total_return"]
-    ann_ret   = metrics["annualized_return"]
-    mdd       = metrics["max_drawdown"]
-    sharpe    = metrics["sharpe_ratio"]
-    sortino   = metrics["sortino_ratio"]
-
-    row("Initial Capital",        f"[bold]${cap_init:,.2f}[/bold]")
-    row("Final Capital",          f"[bold {'green' if cap_final >= cap_init else 'red'}]${cap_final:,.2f}[/bold {'green' if cap_final >= cap_init else 'red'}]")
-    table.add_section()
-    row("Total Return",           f"[{'green' if tot_ret >= 0 else 'red'}]{tot_ret:.2f} %[/{'green' if tot_ret >= 0 else 'red'}]")
-    row("Annualised Return",      f"[{'green' if ann_ret >= 0 else 'red'}]{ann_ret:.2f} %[/{'green' if ann_ret >= 0 else 'red'}]")
-    row("Max Drawdown",           f"[red]{mdd:.2f} %[/red]")
-    table.add_section()
-    row("Sharpe Ratio",           f"[{'green' if sharpe >= 1 else 'yellow' if sharpe >= 0 else 'red'}]{sharpe:.3f}[/{'green' if sharpe >= 1 else 'yellow' if sharpe >= 0 else 'red'}]")
-    row("Sortino Ratio",          f"[{'green' if sortino >= 1 else 'yellow' if sortino >= 0 else 'red'}]{sortino:.3f}[/{'green' if sortino >= 1 else 'yellow' if sortino >= 0 else 'red'}]")
+    row("Initial Capital",        f"[bold]${ic:,.2f}[/bold]")
+    row("Final Capital",          f"[bold {'green' if fc >= ic else 'red'}]${fc:,.2f}[/bold {'green' if fc >= ic else 'red'}]")
+    tbl.add_section()
+    row("Total Return",           f"[{'green' if tr >= 0 else 'red'}]{tr:+.2f}%[/{'green' if tr >= 0 else 'red'}]")
+    row("Annualised Return",      f"[{'green' if ar >= 0 else 'red'}]{ar:+.2f}%[/{'green' if ar >= 0 else 'red'}]")
+    row("Max Drawdown",           f"[red]{mdd:.2f}%[/red]")
+    tbl.add_section()
+    row("Sharpe Ratio",           f"[{'green' if sh >= 1 else 'yellow' if sh >= 0 else 'red'}]{sh:.3f}[/{'green' if sh >= 1 else 'yellow' if sh >= 0 else 'red'}]")
+    row("Sortino Ratio",          f"[{'green' if so >= 1 else 'yellow' if so >= 0 else 'red'}]{so:.3f}[/{'green' if so >= 1 else 'yellow' if so >= 0 else 'red'}]")
     row("Profit Factor",          f"[{'green' if pf == float('inf') or pf >= 1 else 'red'}]{pf_str}[/{'green' if pf == float('inf') or pf >= 1 else 'red'}]")
-    table.add_section()
+    tbl.add_section()
     row("Total Trades",           str(metrics["total_trades"]))
-    row("Win Rate",               f"[{'green' if metrics['win_rate'] >= 50 else 'red'}]{metrics['win_rate']:.2f} %[/{'green' if metrics['win_rate'] >= 50 else 'red'}]")
+    row("Win Rate",               f"[{'green' if metrics['win_rate'] >= 50 else 'red'}]{metrics['win_rate']:.1f}%[/{'green' if metrics['win_rate'] >= 50 else 'red'}]")
     row("Avg Win",                f"[green]+${metrics['avg_win']:,.2f}[/green]")
     row("Avg Loss",               f"[red]-${metrics['avg_loss']:,.2f}[/red]")
-    row("Expectancy (per trade)", f"[{'green' if metrics['expectancy'] >= 0 else 'red'}]${metrics['expectancy']:,.2f}[/{'green' if metrics['expectancy'] >= 0 else 'red'}]")
-    table.add_section()
+    row("Expectancy (per trade)", f"[{'green' if metrics['expectancy'] >= 0 else 'red'}]${metrics['expectancy']:+,.2f}[/{'green' if metrics['expectancy'] >= 0 else 'red'}]")
+    tbl.add_section()
     row("Largest Win",            f"[green]+${metrics['largest_win']:,.2f}[/green]")
     row("Largest Loss",           f"[red]-${abs(metrics['largest_loss']):,.2f}[/red]")
     row("Avg Trade Duration",     f"{metrics['avg_trade_duration']:.1f} h")
-    table.add_section()
+    tbl.add_section()
     row("Total Fees Paid",        f"[yellow]-${metrics['total_fees_paid']:,.2f}[/yellow]")
     row("Total Funding Paid",     f"[yellow]-${metrics['total_funding_paid']:,.2f}[/yellow]")
 
-    console.print(table)
+    console.print(tbl)
     console.print()
 
-    # Last N trades
+    # ── Exit reason breakdown ──────────────────────────────────────────
     if trades:
-        n_show = min(15, len(trades))
-        trade_table = Table(
+        from collections import Counter
+        reasons = Counter(t.get("exit_reason", "?") for t in trades)
+        parts = []
+        colors = {"hard_stop": "red", "trail_stop": "yellow",
+                  "regime_exit": "cyan", "end_of_data": "dim"}
+        for reason, count in sorted(reasons.items(), key=lambda x: -x[1]):
+            c = colors.get(reason, "white")
+            pct = count / len(trades) * 100
+            parts.append(f"[{c}]{reason}[/{c}]: {count} ({pct:.0f}%)")
+        console.print("  Exit reasons: " + "  |  ".join(parts))
+        console.print()
+
+    # ── Recent trades ──────────────────────────────────────────────────
+    if trades:
+        n_show = min(20, len(trades))
+        tt = Table(
             title=f"Last {n_show} Trades",
-            box=box.SIMPLE_HEAVY,
-            title_style="bold cyan",
-            show_header=True,
-            header_style="bold magenta",
-            expand=False,
+            box=box.SIMPLE_HEAVY, title_style="bold cyan",
+            show_header=True, header_style="bold magenta", expand=False,
         )
-        trade_table.add_column("#",       justify="right", style="dim", min_width=4)
-        trade_table.add_column("Dir",     justify="center", min_width=6)
-        trade_table.add_column("Entry",   justify="center", min_width=17)
-        trade_table.add_column("Exit",    justify="center", min_width=17)
-        trade_table.add_column("Entry $", justify="right",  min_width=10)
-        trade_table.add_column("Exit $",  justify="right",  min_width=10)
-        trade_table.add_column("PnL",     justify="right",  min_width=12)
-        trade_table.add_column("Reason",  justify="left",   min_width=12)
+        tt.add_column("#",        justify="right",  style="dim", min_width=4)
+        tt.add_column("Dir",      justify="center",              min_width=6)
+        tt.add_column("Entry",    justify="center",              min_width=17)
+        tt.add_column("Exit",     justify="center",              min_width=17)
+        tt.add_column("Entry $",  justify="right",               min_width=10)
+        tt.add_column("Exit $",   justify="right",               min_width=10)
+        tt.add_column("PnL",      justify="right",               min_width=12)
+        tt.add_column("PnL %",    justify="right",               min_width=8)
+        tt.add_column("Reason",   justify="left",                min_width=12)
 
         reason_colors = {
             "hard_stop":   "red",
-            "regime_flat": "yellow",
-            "regime_flip": "yellow",
+            "trail_stop":  "yellow",
+            "regime_exit": "cyan",
             "end_of_data": "dim",
         }
-
         start_i = len(trades) - n_show + 1
         for idx, t in enumerate(trades[-n_show:], start=start_i):
-            pnl      = t["pnl"]
-            color    = "green" if pnl >= 0 else "red"
-            dir_str  = "[cyan]LONG[/cyan]" if t["direction"] == "long" else "[magenta]SHORT[/magenta]"
-            reason   = t.get("exit_reason", "—")
-            rc       = reason_colors.get(reason, "white")
-            entry_str = fmt_ts(t["entry_time"])
-            exit_str  = fmt_ts(t["exit_time"])
-
-            trade_table.add_row(
-                str(idx),
-                dir_str,
-                entry_str,
-                exit_str,
-                f"${t['entry_price']:,.2f}",
-                f"${t['exit_price']:,.2f}",
-                f"[{color}]{'+' if pnl >= 0 else ''}{pnl:,.2f}[/{color}]",
+            pnl    = t["pnl"]
+            col    = "green" if pnl >= 0 else "red"
+            dir_s  = "[cyan]LONG[/cyan]" if t["direction"] == "long" else "[magenta]SHORT[/magenta]"
+            reason = t.get("exit_reason", "—")
+            rc     = reason_colors.get(reason, "white")
+            tt.add_row(
+                str(idx), dir_s,
+                fmt_ts(t["entry_time"]), fmt_ts(t["exit_time"]),
+                f"${t['entry_price']:,.2f}", f"${t['exit_price']:,.2f}",
+                f"[{col}]{pnl:+,.2f}[/{col}]",
+                f"[{col}]{t['pnl_pct']:+.2f}%[/{col}]",
                 f"[{rc}]{reason}[/{rc}]",
             )
 
-        console.print(trade_table)
+        console.print(tt)
         console.print()
 
+    # ── Equity curve ───────────────────────────────────────────────────
+    _draw_equity_curve(equity)
+
     console.print(Panel(
-        "[dim]Regime backtest complete. "
-        "Bar-by-bar simulation with no lookahead bias. "
+        "[dim]Regime backtest complete. Bar-by-bar simulation — no lookahead bias.\n"
         "Results are for simulation purposes only.[/dim]",
-        border_style="dim",
-        expand=False,
+        border_style="dim", expand=False,
     ))
+    console.print()
+
+
+def _draw_equity_curve(equity: pd.Series, width: int = 70, height: int = 14):
+    if equity.empty:
+        return
+    values = equity.resample("D").last().dropna().values.astype(float)
+    if len(values) < 2:
+        return
+    if len(values) > width:
+        idx    = np.linspace(0, len(values) - 1, width, dtype=int)
+        values = values[idx]
+
+    mn, mx = values.min(), values.max()
+    span   = mx - mn if mx != mn else 1.0
+    normed = ((values - mn) / span * (height - 1)).astype(int)
+
+    console.print(Panel("Equity Curve (daily resampled)", style="bold cyan", expand=False))
+    label_rows = {height - 1: f"${mx:>10,.0f}", height // 2: f"${(mn + span / 2):>10,.0f}", 0: f"${mn:>10,.0f}"}
+
+    for row_i in range(height - 1, -1, -1):
+        chars = []
+        for col, col_val in enumerate(normed):
+            color = "bright_green" if values[col] >= values[0] else "bright_red"
+            dim   = "green"        if values[col] >= values[0] else "red"
+            if col_val == row_i:
+                chars.append(f"[{color}]█[/{color}]")
+            elif col_val > row_i:
+                chars.append(f"[{dim}]│[/{dim}]")
+            else:
+                chars.append(" ")
+        label = label_rows.get(row_i, " " * 12)
+        console.print(f"  [dim]{label}[/dim]  {''.join(chars)}")
+
+    x_l = equity.index[0].strftime("%Y-%m-%d")
+    x_r = equity.index[-1].strftime("%Y-%m-%d")
+    console.print(f"  {'':14}{x_l}{'':>{width - len(x_l) - 2}}{x_r}")
     console.print()
 
 
 if __name__ == "__main__":
-    run_regime_backtest()
+    run()

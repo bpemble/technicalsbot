@@ -80,6 +80,7 @@ class PaperWallet:
         stop_loss: float,
         take_profit: float,
         fee: float,
+        trail_atr: float = 0.0,
     ):
         if strategy in self.state["positions"]:
             raise ValueError(f"Position already open for {strategy}")
@@ -93,6 +94,10 @@ class PaperWallet:
             "take_profit": take_profit,
             "entry_time":  datetime.now(tz=timezone.utc).isoformat(),
             "entry_fee":   fee,
+            "trail_atr":      trail_atr,
+            "trail_active":   False,
+            "trailing_stop":  None,
+            "funding_paid":   0.0,
         }
         self.save()
 
@@ -133,6 +138,24 @@ class PaperWallet:
         self.state["trades"].append(trade)
         self.save()
         return trade
+
+    def update_trailing_stop(self, strategy: str, stop_price: float):
+        pos = self.state["positions"].get(strategy)
+        if pos is None:
+            return
+        pos["trailing_stop"] = stop_price
+        pos["trail_active"]  = True
+        self.save()
+
+    def charge_funding(self, strategy: str, amount: float):
+        """Deduct pro-rated funding cost from capital and record it on the position."""
+        if amount <= 0:
+            return
+        self.state["capital"] -= amount
+        pos = self.state["positions"].get(strategy)
+        if pos is not None:
+            pos["funding_paid"] = pos.get("funding_paid", 0.0) + amount
+        self.save()
 
     def unrealized_pnl(self, strategy: str, current_price: float) -> float:
         pos = self.get_position(strategy)

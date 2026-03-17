@@ -33,6 +33,9 @@ class RegimeSnapshot:
     component_scores: dict = field(default_factory=dict)  # per-TF breakdown
     indicator_scores: dict = field(default_factory=dict)  # per-indicator breakdown
     latest_price: float = 0.0
+    latest_atr: float = 0.0
+    norm_atr_pct: float = 0.0             # normalised ATR percentile (0–1); 0 = unknown
+    ma200_dist: float = 0.0              # (close - MA200) / MA200; 0 = unknown / near MA
 
 
 class RegimeEngine:
@@ -41,10 +44,10 @@ class RegimeEngine:
 
     Indicator components (each normalised to [-1, +1]):
 
-    1. RSI — momentum / overbought-oversold
-       Oversold (RSI < 30) → strongly bullish (+1)
-       Overbought (RSI > 70) → strongly bearish (-1)
-       Formula: clip((50 - RSI) / 35, -1, 1)
+    1. RSI momentum — direction RSI has moved over the last 5 bars
+       Formula: clip((RSI - RSI[−5]) / 30, -1, 1)
+       Rising RSI on a long → bullish; falling RSI on a short → bearish.
+       Avoids the level-trap where RSI stays "overbought" through strong trends.
 
     2. EMA trend — direction
        Price above both EMAs AND fast > slow  → +1  (strong uptrend)
@@ -130,6 +133,21 @@ class RegimeEngine:
         lp = float(df_15m["close"].iloc[-1]) if not df_15m.empty else 0.0
         latest_price = lp if not np.isnan(lp) else 0.0
 
+        atr_4h = self._safe(df_4h.iloc[-1], "atr") if not df_4h.empty else None
+        latest_atr = atr_4h if atr_4h is not None else 0.0
+
+        # Normalised ATR percentile and MA200 distance — from daily bar
+        norm_atr_pct = 0.0
+        ma200_dist   = 0.0
+        if not df_daily.empty:
+            drow = df_daily.iloc[-1]
+            v = self._safe(drow, "norm_atr_pct")
+            if v is not None:
+                norm_atr_pct = v
+            v = self._safe(drow, "ma200_dist")
+            if v is not None:
+                ma200_dist = v
+
         return RegimeSnapshot(
             score=score,
             direction=direction,
@@ -137,6 +155,9 @@ class RegimeEngine:
             component_scores=component_scores,
             indicator_scores=indicator_scores,
             latest_price=latest_price,
+            latest_atr=latest_atr,
+            norm_atr_pct=norm_atr_pct,
+            ma200_dist=ma200_dist,
         )
 
     # ------------------------------------------------------------------
@@ -146,10 +167,10 @@ class RegimeEngine:
     def _score_row(self, row: pd.Series, tf_name: str) -> dict:
         scores = {}
 
-        # ---- 1. RSI -------------------------------------------------
-        rsi = self._safe(row, "rsi")
-        if rsi is not None:
-            scores["rsi"] = float(np.clip((50.0 - rsi) / 35.0, -1.0, 1.0))
+        # ---- 1. RSI momentum ----------------------------------------
+        rsi_mom = self._safe(row, "rsi_momentum")
+        if rsi_mom is not None:
+            scores["rsi_momentum"] = rsi_mom
 
         # ---- 2. EMA trend -------------------------------------------
         close     = self._safe(row, "close")
@@ -180,31 +201,27 @@ class RegimeEngine:
             scores["macd"] = float(np.clip(macd_hist / atr_safe, -1.0, 1.0))
 
         # ---- 4. BB bandwidth/squeeze component ----------------------
-        # Expanding bands after squeeze → trend acceleration (follow direction of price vs mid)
-        # Contracting bands → mean-reversion likely, reduce conviction
-        bb_upper = self._safe(row, "bb_upper")
-        bb_lower = self._safe(row, "bb_lower")
-        bb_mid   = self._safe(row, "bb_mid")
-        if bb_upper is not None and bb_lower is not None and bb_mid is not None and bb_mid > 0:
-            bandwidth = (bb_upper - bb_lower) / bb_mid  # normalised bandwidth
-            if close is not None:
-                direction_sign = 1.0 if close > bb_mid else -1.0
-                normalised_bw = float(np.clip(bandwidth / 0.08, 0, 1))
-                scores["bb_bandwidth"] = direction_sign * normalised_bw
+        bb_bandwidth     = self._safe(row, "bb_bandwidth")
+        bb_bandwidth_p90 = self._safe(row, "bb_bandwidth_p90")
+        bb_mid           = self._safe(row, "bb_mid")
+        if (bb_bandwidth is not None and bb_bandwidth_p90 is not None
+                and bb_bandwidth_p90 > 0 and close is not None and bb_mid is not None):
+            direction_sign = 1.0 if close > bb_mid else -1.0
+            normalised_bw  = float(np.clip(bb_bandwidth / bb_bandwidth_p90, 0, 1))
+            scores["bb_bandwidth"] = direction_sign * normalised_bw
 
-        # ---- 5. Volume confirmation ----------------------------------
-        # High volume amplifies the candle's direction; low volume weakens it.
-        # Uses candle open vs close for intrabar direction.
-        open_price = self._safe(row, "open")
-        volume     = self._safe(row, "volume")
-        volume_sma = self._safe(row, "volume_sma")
-        if (volume is not None and volume_sma is not None and volume_sma > 0
-                and open_price is not None and close is not None):
-            candle_dir = 1.0 if close >= open_price else -1.0
-            ratio      = volume / volume_sma
-            # ratio=1.0 → 0, ratio=2.5 → +1, ratio=0.1 → -0.6
-            normalised = float(np.clip((ratio - 1.0) / 1.5, -1.0, 1.0))
-            scores["volume"] = candle_dir * normalised
+        # ---- 5. Volume confirmation (intraday timeframes only) ------
+        if tf_name != "daily":
+            open_price = self._safe(row, "open")
+            volume     = self._safe(row, "volume")
+            volume_sma = self._safe(row, "volume_sma")
+            if (volume is not None and volume_sma is not None and volume_sma > 0
+                    and open_price is not None and close is not None):
+                candle_dir = 1.0 if close >= open_price else -1.0
+                ratio      = volume / volume_sma
+                # ratio=1.0 → 0, ratio=2.5 → +1, ratio=0.1 → -0.6
+                normalised = float(np.clip((ratio - 1.0) / 1.5, -1.0, 1.0))
+                scores["volume"] = candle_dir * normalised
 
         # ---- 6. ADX trend-quality multiplier ------------------------
         # Scales ALL components down when the market is ranging (low ADX).

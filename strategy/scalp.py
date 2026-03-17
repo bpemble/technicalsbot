@@ -20,6 +20,7 @@ Exits:
 """
 import pandas as pd
 import numpy as np
+import config
 
 
 class ScalpStrategy:
@@ -72,6 +73,7 @@ class ScalpStrategy:
             & (rsi > 40)
             & rsi_rising
             & (merged["close"] > merged["ema_fast"])
+            & (merged["adx"] > config.ADX_TREND_THRESHOLD)
         )
         short_cond = (
             (merged["bias_bull"] == False)
@@ -79,6 +81,7 @@ class ScalpStrategy:
             & (rsi < 60)
             & rsi_falling
             & (merged["close"] < merged["ema_fast"])
+            & (merged["adx"] > config.ADX_TREND_THRESHOLD)
         )
 
         # Only trigger on first bar of a run

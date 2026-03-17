@@ -9,6 +9,8 @@
 #   Hard stop circuit breaker at 8% adverse move regardless of score.
 # ============================================================
 
+import json
+import os
 import time
 import signal
 import sys
@@ -17,6 +19,7 @@ from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 
 from utils import fmt_ts, fmt_now
@@ -27,7 +30,10 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich import box
 
 import config
-from data.fetcher import fetch_funding_rates, fetch_latest_prices, DataCache
+from data.fetcher import (
+    fetch_funding_and_oi, fetch_funding_rates, fetch_latest_prices,
+    fetch_fear_and_greed, DataCache,
+)
 from indicators.compute import add_indicators
 from strategy.regime import RegimeEngine
 from live.paper_wallet import PaperWallet
@@ -61,7 +67,31 @@ def apply_funding_adjustment(score: float, funding_rate: float) -> float:
         return score - normalised * config.FUNDING_PENALTY_MAX
     if score < 0 and normalised < 0:
         return score + abs(normalised) * config.FUNDING_PENALTY_MAX
+    # Opposite extreme funding — contrarian bonus (crowded in their direction, confirms ours)
+    if abs(normalised) >= config.FUNDING_CONTRARIAN_THRESHOLD:
+        if score > 0 and normalised < 0:
+            return score + abs(normalised) * config.FUNDING_CONTRARIAN_BONUS
+        if score < 0 and normalised > 0:
+            return score - normalised * config.FUNDING_CONTRARIAN_BONUS
     return score
+
+
+def apply_oi_adjustment(score: float, oi_change_pct: float) -> float:
+    """
+    Amplify or dampen score based on open-interest change since last tick.
+
+    OI growing  → market participants adding conviction → amplify score.
+    OI shrinking → positions being unwound → dampen score.
+
+    oi_change_pct = (current_oi - prev_oi) / prev_oi.
+    Clamped to ±OI_CHANGE_CLAMP before linear interpolation.
+    """
+    clamped = max(-config.OI_CHANGE_CLAMP, min(config.OI_CHANGE_CLAMP, oi_change_pct))
+    factor  = clamped / config.OI_CHANGE_CLAMP   # maps to [-1, +1]
+    if factor >= 0:
+        return score * (1.0 + factor * config.OI_AMPLIFY_MAX)
+    else:
+        return score * (1.0 + factor * config.OI_DAMPEN_MAX)
 
 
 def _direction_from_score(score: float) -> str:
@@ -85,30 +115,68 @@ signal.signal(signal.SIGINT, _handle_sigint)
 # Data
 # ------------------------------------------------------------------
 
-def fetch_asset(asset: dict, cache: DataCache) -> dict | None:
-    """Return all 4 timeframes for one asset from the cache."""
+def _score_asset(
+    asset: dict,
+    cache: "DataCache",
+    engine: "RegimeEngine",
+    funding_rates: dict | None,
+    oi_values: dict | None = None,
+    prev_oi:   dict | None = None,
+) -> tuple[str, dict | None]:
+    """
+    Fetch data (cached), compute indicators (cached), score regime for one asset.
+    Module-level so it is picklable. ThreadPoolExecutor is used (not ProcessPool)
+    because indicator caching eliminates the CPU bottleneck — I/O dominates.
+    """
+    name = asset["name"]
+    coin = asset["hl"]
     try:
-        coin = asset["hl"]
-        return {
-            "1d":  cache.get(coin, "1d",  config.LOOKBACK_DAYS),
-            "4h":  cache.get(coin, "4h",  config.LOOKBACK_DAYS),
-            "1h":  cache.get(coin, "1h",  7),
-            "15m": cache.get(coin, "15m", config.SCALP_LOOKBACK_DAYS),
+        df_1d  = cache.get_with_indicators(coin, "1d",  config.LOOKBACK_DAYS,       config)
+        df_4h  = cache.get_with_indicators(coin, "4h",  config.LOOKBACK_DAYS,       config)
+        df_1h  = cache.get_with_indicators(coin, "1h",  7,                          config)
+        df_15m = cache.get_with_indicators(coin, "15m", config.SCALP_LOOKBACK_DAYS, config)
+        snapshot = engine.compute(df_1d, df_4h, df_1h, df_15m)
+        hl_name  = asset.get("hl", name)
+        fr       = (funding_rates or {}).get(hl_name, 0.0)
+        adj      = apply_funding_adjustment(snapshot.score, fr)
+
+        # OI trend adjustment
+        if oi_values and prev_oi:
+            cur_oi  = oi_values.get(hl_name, 0.0)
+            past_oi = prev_oi.get(hl_name, cur_oi)
+            if past_oi > 0:
+                oi_change = (cur_oi - past_oi) / past_oi
+                adj = apply_oi_adjustment(adj, oi_change)
+
+        return name, {
+            "asset":        asset,
+            "snapshot":     snapshot,
+            "price":        snapshot.latest_price,
+            "adj_score":    adj,
+            "funding_rate": fr,
         }
-    except Exception:
-        return None
+    except Exception as e:
+        logger.warning(f"{name}: {e}")
+        return name, None
 
 
 # ------------------------------------------------------------------
 # Regime computation across all assets
 # ------------------------------------------------------------------
 
-def compute_all_regimes(engine: RegimeEngine, cache: DataCache, funding_rates: dict | None = None) -> list[dict]:
+def compute_all_regimes(
+    engine: RegimeEngine,
+    cache: DataCache,
+    funding_rates: dict | None = None,
+    oi_values: dict | None = None,
+    prev_oi:   dict | None = None,
+) -> list[dict]:
     """
     Loop over all config.ASSETS in parallel, fetch data, compute regime snapshot.
 
-    funding_rates : optional {hl_name: hourly_rate} from fetch_funding_rates().
-                    When provided, each asset's score is adjusted for funding crowding.
+    funding_rates : optional {hl_name: hourly_rate} — funding crowding adjustment.
+    oi_values     : optional {hl_name: open_interest} — current tick OI.
+    prev_oi       : optional {hl_name: open_interest} — previous tick OI for delta.
 
     Returns list of dicts sorted by abs(adj_score) descending:
       [{"asset": ..., "snapshot": ..., "price": float,
@@ -116,33 +184,11 @@ def compute_all_regimes(engine: RegimeEngine, cache: DataCache, funding_rates: d
     """
     results = []
 
-    def process_asset(asset):
-        name = asset["name"]
-        frames = fetch_asset(asset, cache)
-        if frames is None:
-            return name, None
-        try:
-            df_1d  = add_indicators(frames["1d"],  config)
-            df_4h  = add_indicators(frames["4h"],  config)
-            df_1h  = add_indicators(frames["1h"],  config)
-            df_15m = add_indicators(frames["15m"], config)
-            snapshot = engine.compute(df_1d, df_4h, df_1h, df_15m)
-            hl_name  = asset.get("hl", asset["name"])
-            fr       = (funding_rates or {}).get(hl_name, 0.0)
-            adj      = apply_funding_adjustment(snapshot.score, fr)
-            return name, {
-                "asset":        asset,
-                "snapshot":     snapshot,
-                "price":        snapshot.latest_price,
-                "adj_score":    adj,
-                "funding_rate": fr,
-            }
-        except Exception as e:
-            logger.warning(f"{name}: indicator/regime error: {e}")
-            return name, None
-
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(process_asset, asset): asset for asset in config.ASSETS}
+        futures = {
+            executor.submit(_score_asset, asset, cache, engine, funding_rates, oi_values, prev_oi): asset
+            for asset in config.ASSETS
+        }
         for future in as_completed(futures):
             name, result = future.result()
             if result is not None:
@@ -186,6 +232,94 @@ def target_position_size(score: float, equity: float, price: float) -> float:
 
 
 # ------------------------------------------------------------------
+# Correlation scaling
+# ------------------------------------------------------------------
+
+def _tier_correlation_factor(wallet: PaperWallet, asset_name: str, asset_tier: int, target_dir: str) -> float:
+    """Scale position size down for each additional same-tier same-direction position."""
+    count = sum(
+        1 for name, pos in wallet.positions.items()
+        if name != asset_name
+        and pos["direction"] == target_dir
+        and any(a["name"] == name and a["tier"] == asset_tier for a in config.ASSETS)
+    )
+    return config.TIER_CORR_FACTOR ** count
+
+
+# ------------------------------------------------------------------
+# Additional position-sizing factors
+# ------------------------------------------------------------------
+
+def _btc_size_factor(regimes: list[dict], asset_name: str, target_dir: str) -> float:
+    """
+    BTC regime gate: scale size up when BTC aligns, down when opposed.
+
+    BTC is the market-wide risk barometer. Entering a long while BTC is
+    bearish — or a short while BTC is bullish — materially reduces edge.
+
+    Returns a multiplier in [0.5, 1.2].
+    """
+    if asset_name == "BTC":
+        return 1.0
+    btc_entry = next((r for r in regimes if r["asset"]["name"] == "BTC"), None)
+    if btc_entry is None:
+        return 1.0
+    btc_score = btc_entry["adj_score"]
+    aligned = (
+        (target_dir == "long"  and btc_score >  config.MIN_CONVICTION_SCORE) or
+        (target_dir == "short" and btc_score < -config.MIN_CONVICTION_SCORE)
+    )
+    opposed = (
+        (target_dir == "long"  and btc_score < -config.MIN_CONVICTION_SCORE) or
+        (target_dir == "short" and btc_score >  config.MIN_CONVICTION_SCORE)
+    )
+    if aligned:
+        strength = min(abs(btc_score) / 100.0, 1.0)
+        return 1.0 + 0.2 * strength   # up to 1.2
+    if opposed:
+        return 0.5
+    return 1.0   # BTC flat
+
+
+def _vol_size_factor(snapshot) -> float:
+    """
+    Low-volatility brake: reduce size when ATR percentile is unusually low.
+
+    Thin-volatility markets have weak follow-through; high conviction in a
+    quiet market often means the signal hasn't been tested yet.
+
+    Returns multiplier in [VOL_REGIME_MIN, 1.0].
+    """
+    pct = snapshot.norm_atr_pct
+    if pct <= 0 or (isinstance(pct, float) and np.isnan(pct)):
+        return 1.0
+    if pct >= config.VOL_REGIME_LOW:
+        return 1.0
+    # Linear: VOL_REGIME_MIN at pct=0, 1.0 at pct=VOL_REGIME_LOW
+    return config.VOL_REGIME_MIN + (1.0 - config.VOL_REGIME_MIN) * (pct / config.VOL_REGIME_LOW)
+
+
+def _ma200_size_factor(snapshot) -> float:
+    """
+    MA200 extension brake: penalise entries when price is stretched far from MA200.
+
+    Price well beyond its 200-bar mean is statistically prone to mean reversion;
+    reduce size to limit exposure to snap-backs.
+
+    Returns multiplier in [0.5, 1.0].
+    """
+    dist = abs(snapshot.ma200_dist)
+    if dist <= 0 or (isinstance(dist, float) and np.isnan(dist)):
+        return 1.0
+    if dist <= config.MA200_NEAR_BAND:
+        return 1.0
+    if dist >= config.MA200_FAR_BAND:
+        return 0.5
+    frac = (dist - config.MA200_NEAR_BAND) / (config.MA200_FAR_BAND - config.MA200_NEAR_BAND)
+    return 1.0 - 0.5 * frac
+
+
+# ------------------------------------------------------------------
 # Hard stops
 # ------------------------------------------------------------------
 
@@ -201,52 +335,124 @@ def check_hard_stops(wallet: PaperWallet, price_lookup: dict[str, float]):
         if current_price is None:
             continue
 
-        direction = pos["direction"]
+        direction  = pos["direction"]
+        trail_atr  = pos.get("trail_atr", 0.0)
 
-        if direction == "long" and current_price <= pos["stop_loss"]:
-            fee   = pos["size"] * current_price * config.EXCHANGE_FEE
-            trade = wallet.close_position(asset_name, current_price, "hard_stop", fee)
-            if trade:
-                entry = pos["entry_price"]
-                move_pct = (current_price - entry) / entry * 100
-                msg = (
-                    f"HARD STOP {asset_name} LONG entered @ ${entry:,.2f}, "
-                    f"now ${current_price:,.2f} ({move_pct:.1f}%)  "
-                    f"PnL: ${trade['net_pnl']:+,.2f}"
-                )
-                console.print(f"  [red bold]{msg}[/red bold]")
-                logger.info(msg)
-        elif direction == "short" and current_price >= pos["stop_loss"]:
-            fee   = pos["size"] * current_price * config.EXCHANGE_FEE
-            trade = wallet.close_position(asset_name, current_price, "hard_stop", fee)
-            if trade:
-                entry = pos["entry_price"]
-                move_pct = (entry - current_price) / entry * 100
-                msg = (
-                    f"HARD STOP {asset_name} SHORT entered @ ${entry:,.2f}, "
-                    f"now ${current_price:,.2f} ({move_pct:.1f}%)  "
-                    f"PnL: ${trade['net_pnl']:+,.2f}"
-                )
-                console.print(f"  [red bold]{msg}[/red bold]")
-                logger.info(msg)
+        # Update trailing stop when price moves favourably
+        if trail_atr > 0:
+            activation_dist = trail_atr * config.TRAIL_ACTIVATION_ATR
+            trail_dist      = trail_atr * config.TRAIL_ATR_MULTIPLIER
+            entry_price     = pos["entry_price"]
+            cur_trail       = pos.get("trailing_stop")
+            if direction == "long":
+                if current_price - entry_price >= activation_dist:
+                    candidate = current_price - trail_dist
+                    if cur_trail is None or candidate > cur_trail:
+                        wallet.update_trailing_stop(asset_name, candidate)
+            else:
+                if entry_price - current_price >= activation_dist:
+                    candidate = current_price + trail_dist
+                    if cur_trail is None or candidate < cur_trail:
+                        wallet.update_trailing_stop(asset_name, candidate)
+
+        pos = wallet.get_position(asset_name)
+        if pos is None:
+            continue
+
+        hard_stop     = pos["stop_loss"]
+        trailing_stop = pos.get("trailing_stop")
+        if trailing_stop is not None:
+            effective_stop = (max(hard_stop, trailing_stop) if direction == "long"
+                              else min(hard_stop, trailing_stop))
+        else:
+            effective_stop = hard_stop
+
+        hit = (
+            (direction == "long"  and current_price <= effective_stop) or
+            (direction == "short" and current_price >= effective_stop)
+        )
+        if not hit:
+            continue
+
+        is_trail    = trailing_stop is not None and effective_stop == trailing_stop
+        exit_reason = "trail_stop" if is_trail else "hard_stop"
+        fee         = pos["size"] * current_price * config.EXCHANGE_FEE
+        trade       = wallet.close_position(asset_name, current_price, exit_reason, fee)
+        if trade:
+            entry    = pos["entry_price"]
+            move_pct = ((current_price - entry) / entry * 100 if direction == "long"
+                        else (entry - current_price) / entry * 100)
+            pnl_color = "green" if trade["net_pnl"] >= 0 else "red"
+            style     = "red bold" if exit_reason == "hard_stop" else pnl_color
+            msg = (
+                f"{exit_reason.upper()} {asset_name} {direction.upper()} "
+                f"entered @ ${entry:,.2f}, now ${current_price:,.2f} ({move_pct:.1f}%)  "
+                f"PnL: ${trade['net_pnl']:+,.2f}"
+            )
+            console.print(f"  [{style}]{msg}[/{style}]")
+            logger.info(msg)
 
 
 # ------------------------------------------------------------------
 # Portfolio rebalancing
 # ------------------------------------------------------------------
 
-def rebalance_portfolio(wallet: PaperWallet, regimes: list[dict]):
+def _open_new_position(
+    wallet: PaperWallet,
+    asset_name: str,
+    target_dir: str,
+    current_price: float,
+    want_size: float,
+    trail_atr: float,
+) -> float:
+    """Open a paper position with slippage, fees, ATR-based stop, and trail metadata. Returns fill price."""
+    fill = current_price * (1 + config.SLIPPAGE if target_dir == "long" else 1 - config.SLIPPAGE)
+    fee  = want_size * fill * config.EXCHANGE_FEE
+
+    # ATR-based stop: tighter on low-volatility assets, capped at HARD_STOP_PCT on wild alts.
+    # TP at 3× stop distance — trailing stop and regime exit do the real work in trends.
+    if trail_atr > 0:
+        stop_dist = min(trail_atr * config.ATR_STOP_MULTIPLIER, fill * HARD_STOP_PCT)
+    else:
+        stop_dist = fill * HARD_STOP_PCT
+    tp_dist = stop_dist * 3
+
+    wallet.open_position(
+        strategy    = asset_name,
+        direction   = target_dir,
+        entry_price = fill,
+        size        = want_size,
+        stop_loss   = (fill - stop_dist) if target_dir == "long" else (fill + stop_dist),
+        take_profit = (fill + tp_dist)   if target_dir == "long" else (fill - tp_dist),
+        fee         = fee,
+        trail_atr   = trail_atr,
+    )
+    return fill
+
+
+def rebalance_portfolio(wallet: PaperWallet, regimes: list[dict], fng_value: int = -1):
     """
     1. Select top MAX_POSITIONS assets where abs(score) > MIN_CONVICTION_SCORE.
     2. Close positions not in that active set.
     3. Open / flip / resize positions for each active asset.
+
+    fng_value : Fear & Greed Index (0–100), or -1 if unavailable.
+                ≥ FNG_EXTREME_GREED → cut max positions and penalise longs.
     """
+    # Apply F&G position cap
+    effective_max = config.MAX_POSITIONS
+    if fng_value >= config.FNG_EXTREME_GREED:
+        effective_max = max(1, config.MAX_POSITIONS - config.FNG_POSITIONS_REDUCE)
+
     # Build active set from sorted regimes
     active_set: dict[str, dict] = {}
     for entry in regimes:
-        if len(active_set) >= config.MAX_POSITIONS:
+        if len(active_set) >= effective_max:
             break
         score = entry["adj_score"]
+        # Apply F&G long penalty during extreme greed
+        if fng_value >= config.FNG_EXTREME_GREED and score > 0:
+            score = score - config.FNG_GREED_LONG_PENALTY
         if abs(score) > config.MIN_CONVICTION_SCORE:
             asset_name = entry["asset"]["name"]
             active_set[asset_name] = entry
@@ -292,7 +498,14 @@ def rebalance_portfolio(wallet: PaperWallet, regimes: list[dict]):
                     logger.info(msg)
             continue
 
-        want_size = target_position_size(score, equity, current_price)
+        corr_factor  = _tier_correlation_factor(wallet, asset_name, entry["asset"]["tier"], target_dir)
+        btc_factor   = _btc_size_factor(regimes, asset_name, target_dir)
+        vol_factor   = _vol_size_factor(snapshot)
+        ma200_factor = _ma200_size_factor(snapshot)
+        want_size = (
+            target_position_size(score, equity, current_price)
+            * corr_factor * btc_factor * vol_factor * ma200_factor
+        )
         if want_size <= 0:
             continue
 
@@ -300,25 +513,15 @@ def rebalance_portfolio(wallet: PaperWallet, regimes: list[dict]):
 
         # No position — open one
         if pos is None:
-            fill = current_price * (
-                1 + config.SLIPPAGE if target_dir == "long" else 1 - config.SLIPPAGE
-            )
-            fee = want_size * fill * config.EXCHANGE_FEE
-            wallet.open_position(
-                strategy    = asset_name,
-                direction   = target_dir,
-                entry_price = fill,
-                size        = want_size,
-                stop_loss   = fill * (1 - HARD_STOP_PCT) if target_dir == "long"
-                              else fill * (1 + HARD_STOP_PCT),
-                take_profit = fill * (1 + HARD_STOP_PCT * 3) if target_dir == "long"
-                              else fill * (1 - HARD_STOP_PCT * 3),
-                fee         = fee,
-            )
+            if want_size <= 0:
+                continue
+            trail_atr = snapshot.latest_atr
+            fill = _open_new_position(wallet, asset_name, target_dir, current_price, want_size, trail_atr)
             dir_color = "cyan" if target_dir == "long" else "magenta"
             msg = (
                 f"OPENED {asset_name} {target_dir.upper()} "
                 f"@ ${fill:,.2f}  size={want_size:.4f}  score={score:+.1f}"
+                + (f"  corr={corr_factor:.2f}" if corr_factor < 1.0 else "")
             )
             console.print(f"  [{dir_color}]{msg}[/{dir_color}]")
             logger.info(msg)
@@ -340,21 +543,8 @@ def rebalance_portfolio(wallet: PaperWallet, regimes: list[dict]):
                 )
                 console.print(f"  [{pnl_color}]{flip_msg}[/{pnl_color}]")
                 logger.info(flip_msg)
-            fill = current_price * (
-                1 + config.SLIPPAGE if target_dir == "long" else 1 - config.SLIPPAGE
-            )
-            fee = want_size * fill * config.EXCHANGE_FEE
-            wallet.open_position(
-                strategy    = asset_name,
-                direction   = target_dir,
-                entry_price = fill,
-                size        = want_size,
-                stop_loss   = fill * (1 - HARD_STOP_PCT) if target_dir == "long"
-                              else fill * (1 + HARD_STOP_PCT),
-                take_profit = fill * (1 + HARD_STOP_PCT * 3) if target_dir == "long"
-                              else fill * (1 - HARD_STOP_PCT * 3),
-                fee         = fee,
-            )
+            trail_atr = snapshot.latest_atr
+            fill = _open_new_position(wallet, asset_name, target_dir, current_price, want_size, trail_atr)
             dir_color = "cyan" if target_dir == "long" else "magenta"
             open_msg = (
                 f"OPENED {asset_name} {target_dir.upper()} "
@@ -369,21 +559,8 @@ def rebalance_portfolio(wallet: PaperWallet, regimes: list[dict]):
         if size_diff_pct > REBALANCE_THRESHOLD:
             fee = current_size * current_price * config.EXCHANGE_FEE
             wallet.close_position(asset_name, current_price, "resize", fee)
-            fill = current_price * (
-                1 + config.SLIPPAGE if target_dir == "long" else 1 - config.SLIPPAGE
-            )
-            fee  = want_size * fill * config.EXCHANGE_FEE
-            wallet.open_position(
-                strategy    = asset_name,
-                direction   = target_dir,
-                entry_price = fill,
-                size        = want_size,
-                stop_loss   = fill * (1 - HARD_STOP_PCT) if target_dir == "long"
-                              else fill * (1 + HARD_STOP_PCT),
-                take_profit = fill * (1 + HARD_STOP_PCT * 3) if target_dir == "long"
-                              else fill * (1 - HARD_STOP_PCT * 3),
-                fee         = fee,
-            )
+            trail_atr = snapshot.latest_atr
+            fill = _open_new_position(wallet, asset_name, target_dir, current_price, want_size, trail_atr)
             resize_msg = (
                 f"RESIZED {asset_name} {target_dir.upper()}  "
                 f"{current_size:.4f} → {want_size:.4f}  score={score:+.1f}"
@@ -532,6 +709,12 @@ def print_portfolio(regimes: list[dict], wallet: PaperWallet):
 
             entry_time_str = fmt_ts(pos.get("entry_time"))
 
+            trailing_stop = pos.get("trailing_stop")
+            if trailing_stop is not None:
+                stop_cell = f"[yellow]~${trailing_stop:,.2f}[/yellow]"
+            else:
+                stop_cell = f"${pos['stop_loss']:,.2f}"
+
             pt.add_row(
                 f"[bold]{asset_name}[/bold]",
                 f"[{dir_color}]{pos['direction'].upper()}[/{dir_color}]",
@@ -539,7 +722,7 @@ def print_portfolio(regimes: list[dict], wallet: PaperWallet):
                 cur_str,
                 f"{pos['size']:.4f}",
                 f"[{upnl_color}]${upnl:+,.2f}[/{upnl_color}]",
-                f"${pos['stop_loss']:,.2f}",
+                stop_cell,
                 entry_time_str,
             )
 
@@ -569,9 +752,32 @@ def print_portfolio(regimes: list[dict], wallet: PaperWallet):
 # Main loop
 # ------------------------------------------------------------------
 
+def _charge_funding(wallet: PaperWallet, regimes: list[dict], funding_rates: dict):
+    """Charge pro-rated hourly funding on all open positions once per scan tick."""
+    if not funding_rates:
+        return
+    hours_elapsed = config.POLL_INTERVAL_SEC / 3600
+    price_map   = {r["asset"]["name"]: r["price"]        for r in regimes}
+    hl_name_map = {r["asset"]["name"]: r["asset"]["hl"]  for r in regimes}
+    for asset_name in list(wallet.positions.keys()):
+        pos = wallet.get_position(asset_name)
+        if pos is None:
+            continue
+        hl_name      = hl_name_map.get(asset_name, asset_name)
+        hourly_rate  = funding_rates.get(hl_name, 0.0)
+        current_price = price_map.get(asset_name, pos["entry_price"])
+        notional     = pos["size"] * current_price
+        charge       = notional * abs(hourly_rate) * hours_elapsed
+        pays = (
+            (pos["direction"] == "long"  and hourly_rate > 0) or
+            (pos["direction"] == "short" and hourly_rate < 0)
+        )
+        if pays and charge > 0:
+            wallet.charge_funding(asset_name, charge)
+
+
 def _save_equity_snapshot(wallet: "PaperWallet", regimes: list[dict]):
     """Append current equity to equity_history.jsonl for the dashboard chart."""
-    import json
     price_map = {r["asset"]["name"]: r["price"] for r in regimes}
     upnl      = wallet.total_unrealized_pnl(price_map)
     equity    = wallet.capital + upnl
@@ -582,7 +788,6 @@ def _save_equity_snapshot(wallet: "PaperWallet", regimes: list[dict]):
 
 def _save_scores(regimes: list[dict], tick: int):
     """Persist latest regime scores to scores.json for the dashboard."""
-    import json, os
     data = {
         "tick":          tick,
         "timestamp":     fmt_now(),
@@ -640,12 +845,15 @@ def run():
         "4h":  config.LOOKBACK_DAYS,
         "1h":  7,
         "15m": config.SCALP_LOOKBACK_DAYS,
-    })
+    }, config)
     console.print("  [green]Cache warmed.[/green]")
     console.print()
 
-    tick    = 0
-    regimes = []   # kept in scope so fast loop can reference open positions
+    tick             = 0
+    regimes:   list  = []    # kept in scope so fast loop can reference open positions
+    prev_oi:   dict  = {}    # OI snapshot from previous tick for delta computation
+    fng_value: int   = -1    # cached F&G index
+    fng_last_refresh = 0.0   # time.time() of last F&G fetch
 
     while _running:
         # ---- Full regime scan ----------------------------------------
@@ -653,18 +861,36 @@ def run():
         console.rule(f"[dim]Tick {tick}  —  {fmt_now()}[/dim]")
         console.print()
 
-        console.print("  [dim]Refreshing data and funding rates...[/dim]")
-        funding_rates = fetch_funding_rates()
-        regimes = compute_all_regimes(engine, cache, funding_rates)
+        console.print("  [dim]Refreshing data, funding rates, and OI...[/dim]")
+        funding_rates, oi_values = fetch_funding_and_oi()
+
+        # Refresh Fear & Greed (at most once per FNG_CACHE_TTL_SEC)
+        now_ts = time.time()
+        if now_ts - fng_last_refresh >= config.FNG_CACHE_TTL_SEC:
+            fng_value        = fetch_fear_and_greed()
+            fng_last_refresh = now_ts
+            if fng_value >= 0:
+                if fng_value <= config.FNG_EXTREME_FEAR:
+                    fng_label = f"[green]F&G={fng_value} (extreme fear — contrarian open)[/green]"
+                elif fng_value >= config.FNG_EXTREME_GREED:
+                    fng_label = f"[red]F&G={fng_value} (extreme greed — reducing longs)[/red]"
+                else:
+                    fng_label = f"[dim]F&G={fng_value}[/dim]"
+                console.print(f"  Fear & Greed Index: {fng_label}")
+
+        regimes = compute_all_regimes(engine, cache, funding_rates, oi_values, prev_oi)
+        prev_oi = oi_values   # store for next tick's delta
 
         if not regimes:
             console.print("  [red]No asset data available this tick — skipping.[/red]")
         else:
             price_lookup = {r["asset"]["name"]: r["price"] for r in regimes}
             check_hard_stops(wallet, price_lookup)
-            rebalance_portfolio(wallet, regimes)
+            rebalance_portfolio(wallet, regimes, fng_value)
             print_portfolio(regimes, wallet)
             _save_scores(regimes, tick)
+            _save_equity_snapshot(wallet, regimes)
+            _charge_funding(wallet, regimes, funding_rates)
 
         if not _running:
             break
