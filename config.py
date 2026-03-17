@@ -88,8 +88,9 @@ POLL_INTERVAL_SEC = 60         # seconds between full regime scans
 FAST_POLL_SEC     = 15         # seconds between lightweight hard-stop checks
 
 # --------------- Logging -------------------------------------
-LOG_FILE    = "bot.log"
-SCORES_FILE = "scores.json"   # latest regime scores written each scan
+LOG_FILE             = "bot.log"
+SCORES_FILE          = "scores.json"          # latest regime scores written each scan
+EQUITY_HISTORY_FILE  = "equity_history.jsonl" # equity snapshots written each tick
 
 # --------------- Multi-asset portfolio -----------------------
 MAX_POSITIONS = 10          # max simultaneous open positions

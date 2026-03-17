@@ -45,7 +45,7 @@ console = Console()
 _running = True
 
 HARD_STOP_PCT       = 0.08   # 8% hard circuit breaker
-REBALANCE_THRESHOLD = 0.15   # only resize if >15% off target
+REBALANCE_THRESHOLD = 0.25   # only resize if >25% off target
 
 
 def apply_funding_adjustment(score: float, funding_rate: float) -> float:
@@ -568,6 +568,17 @@ def print_portfolio(regimes: list[dict], wallet: PaperWallet):
 # ------------------------------------------------------------------
 # Main loop
 # ------------------------------------------------------------------
+
+def _save_equity_snapshot(wallet: "PaperWallet", regimes: list[dict]):
+    """Append current equity to equity_history.jsonl for the dashboard chart."""
+    import json
+    price_map = {r["asset"]["name"]: r["price"] for r in regimes}
+    upnl      = wallet.total_unrealized_pnl(price_map)
+    equity    = wallet.capital + upnl
+    entry     = {"t": datetime.now(tz=timezone.utc).isoformat(), "v": round(equity, 2)}
+    with open(config.EQUITY_HISTORY_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
 
 def _save_scores(regimes: list[dict], tick: int):
     """Persist latest regime scores to scores.json for the dashboard."""

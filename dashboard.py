@@ -4,6 +4,7 @@ Run: uvicorn dashboard:app --host 0.0.0.0 --port 8080
 """
 
 import json
+import math
 import os
 from datetime import datetime, timezone
 
@@ -30,6 +31,32 @@ def _load_json(path: str) -> dict:
         return json.load(f)
 
 
+def _load_equity_history() -> list[dict]:
+    """Load equity snapshots from the JSONL history file."""
+    path = config.EQUITY_HISTORY_FILE
+    if not os.path.exists(path):
+        return []
+    pts = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    pts.append(json.loads(line))
+                except Exception:
+                    pass
+    return pts
+
+
+def _append_equity_snapshot(point: dict):
+    """Append an equity snapshot to the history file (used by dashboard for live prices)."""
+    try:
+        with open(config.EQUITY_HISTORY_FILE, "a") as f:
+            f.write(json.dumps(point) + "\n")
+    except Exception:
+        pass
+
+
 def _live_prices() -> dict[str, float]:
     try:
         r = _hl_session.post(HL_API, json={"type": "allMids"}, timeout=HL_TIMEOUT)
@@ -43,9 +70,10 @@ def _live_prices() -> dict[str, float]:
 
 @app.get("/api/status")
 def api_status():
-    wallet = _load_json(config.REGIME_STATE_FILE)
-    scores = _load_json(config.SCORES_FILE)
-    prices = _live_prices()
+    wallet          = _load_json(config.REGIME_STATE_FILE)
+    scores          = _load_json(config.SCORES_FILE)
+    prices          = _live_prices()
+    equity_history  = _load_equity_history()
 
     positions = wallet.get("positions", {})
     trades    = wallet.get("trades",    [])
@@ -101,6 +129,48 @@ def api_status():
     total_fees = sum(t.get("exit_fee", 0) + t.get("entry_fee", 0) for t in trades)
     expectancy = (win_rate / 100 * avg_win) + ((1 - win_rate / 100) * avg_loss)
 
+    # ── Annualised return & Sharpe ────────────────────────────────────────────
+    # Prefer per-minute equity snapshots (more data); fall back to closed-trade curve.
+    stat_pts = equity_history if len(equity_history) >= 3 else [p for p in equity_curve if p.get("t")]
+    ann_return_pct = 0.0
+    sharpe         = 0.0
+    days_live      = 0.0
+
+    if stat_pts:
+        try:
+            first_dt  = datetime.fromisoformat(stat_pts[0]["t"])
+            now_dt    = datetime.now(tz=timezone.utc)
+            days_live = (now_dt - first_dt).total_seconds() / 86400
+            if days_live > 0 and initial > 0:
+                ann_return_pct = ((equity / initial) ** (365.25 / days_live) - 1) * 100
+        except Exception:
+            pass
+
+    if len(stat_pts) >= 3 and days_live > 0:
+        try:
+            vals = [initial] + [p["v"] for p in stat_pts]
+            rets = [(vals[i] - vals[i-1]) / vals[i-1]
+                    for i in range(1, len(vals)) if vals[i-1] > 0]
+            if len(rets) >= 2:
+                n        = len(rets)
+                mean_r   = sum(rets) / n
+                variance = sum((r - mean_r) ** 2 for r in rets) / (n - 1)
+                std_r    = math.sqrt(variance)
+                if std_r > 0:
+                    pts_per_year = n / days_live * 365.25
+                    sharpe = mean_r / std_r * math.sqrt(pts_per_year)
+        except Exception:
+            pass
+
+    # ── Live equity snapshot (written each dashboard poll for live-price candles) ─
+    now_iso    = datetime.now(tz=timezone.utc).isoformat()
+    live_point = {"t": now_iso, "v": round(equity, 2)}
+    _append_equity_snapshot(live_point)
+
+    # Build snapshot list for the client: history + this live point
+    # Cap at last 20 000 points (~1 week at 30 s poll cadence) to limit payload
+    equity_snapshots = (equity_history + [live_point])[-20_000:]
+
     # ── Recent trades (last 30, newest first) ────────────────────────────────
     recent_trades = []
     for t in reversed(sorted_trades[-30:]):
@@ -128,8 +198,12 @@ def api_status():
         "total_upnl":    round(total_upnl, 2),
         "positions":     enriched_positions,
         "regime":        scores.get("assets", []),
-        "equity_curve":  equity_curve,
-        "trades":        recent_trades,
+        "equity_curve":     equity_curve,
+        "equity_snapshots": equity_snapshots,
+        "trades":           recent_trades,
+        "ann_return_pct":   round(ann_return_pct, 2),
+        "sharpe":           round(sharpe, 3),
+        "days_live":        round(days_live, 1),
         "performance": {
             "total_trades": len(trades),
             "win_rate":     round(win_rate, 1),
@@ -297,9 +371,14 @@ HTML = r"""<!DOCTYPE html>
   .reason-resize         { background: rgba(255,255,255,0.05); color: var(--muted); }
   .reason-regime_flat    { background: rgba(255,255,255,0.05); color: var(--muted); }
 
+  /* ── Timeframe toggle ── */
+  .tf-btn { padding: 2px 9px; border: 1px solid var(--border); border-radius: 3px; background: transparent; color: var(--muted); font-size: 9px; letter-spacing: 0.09em; text-transform: uppercase; cursor: pointer; font-family: var(--font); transition: all 0.15s; }
+  .tf-btn:hover { border-color: var(--gold); color: var(--gold); }
+  .tf-btn.active { border-color: var(--gold); color: var(--gold); background: var(--gold-dim); }
+
   /* ── Equity curve ── */
   .chart-wrap { padding: 4px 0 0; position: relative; }
-  #equity-chart { width: 100%; height: 220px; }
+  #equity-chart { width: 100%; height: 260px; }
   #equity-tooltip {
     position: absolute;
     top: 14px; left: 14px;
@@ -387,9 +466,19 @@ HTML = r"""<!DOCTYPE html>
       <div class="stat-sub" id="s-trades">—</div>
     </div>
     <div class="stat">
-      <div class="stat-label">Expectancy</div>
+      <div class="stat-label">Avg Trade PnL</div>
       <div class="stat-value" id="s-expectancy">—</div>
       <div class="stat-sub" id="s-avgwinloss">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Ann. Return</div>
+      <div class="stat-value" id="s-annret">—</div>
+      <div class="stat-sub" id="s-dayslive">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Sharpe Ratio</div>
+      <div class="stat-value" id="s-sharpe">—</div>
+      <div class="stat-sub" id="s-sharpe-sub">annualised</div>
     </div>
     <div class="stat">
       <div class="stat-label">Next Scan</div>
@@ -402,7 +491,14 @@ HTML = r"""<!DOCTYPE html>
   <div class="card">
     <div class="card-header">
       <div class="card-title">Equity Curve</div>
-      <div class="card-meta" id="curve-meta">—</div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <div style="display:flex;gap:4px">
+          <button class="tf-btn active" data-mins="5"    onclick="setCandle(5)">5M</button>
+          <button class="tf-btn"        data-mins="60"   onclick="setCandle(60)">1H</button>
+          <button class="tf-btn"        data-mins="1440" onclick="setCandle(1440)">1D</button>
+        </div>
+        <div class="card-meta" id="curve-meta">—</div>
+      </div>
     </div>
     <div class="chart-wrap">
       <div id="equity-chart"></div>
@@ -517,37 +613,68 @@ function scoreBar(score, dir) {
 }
 
 // ── Equity curve (TradingView Lightweight Charts) ─────────────────────────────
-let _equityChart = null;
+let _equityChart   = null;
+let _candleInterval = 5;   // minutes; user-selectable
+let _lastD          = null; // cached API response for re-renders on toggle
 
-function renderEquityCurve(points, initial) {
+function buildOHLC(points, intervalMinutes) {
+  const bucketSec = intervalMinutes * 60;
+  const candles   = {};
+  for (const pt of points) {
+    try {
+      const ts     = new Date(pt.t).getTime() / 1000;
+      const bucket = Math.floor(ts / bucketSec) * bucketSec;
+      const v      = pt.v;
+      if (!candles[bucket]) {
+        candles[bucket] = { time: bucket, open: v, high: v, low: v, close: v };
+      } else {
+        const c = candles[bucket];
+        if (v > c.high) c.high = v;
+        if (v < c.low)  c.low  = v;
+        c.close = v;
+      }
+    } catch(e) {}
+  }
+  const sorted = Object.values(candles).sort((a, b) => a.time - b.time);
+  // Pin each candle's open to the previous candle's close — no gaps
+  for (let i = 1; i < sorted.length; i++) {
+    sorted[i].open = sorted[i - 1].close;
+    sorted[i].high = Math.max(sorted[i].high, sorted[i].open);
+    sorted[i].low  = Math.min(sorted[i].low,  sorted[i].open);
+  }
+  return sorted;
+}
+
+function setCandle(mins) {
+  _candleInterval = mins;
+  document.querySelectorAll('.tf-btn').forEach(b =>
+    b.classList.toggle('active', parseInt(b.dataset.mins) === mins)
+  );
+  if (_lastD) renderEquityCurve(_lastD);
+}
+
+function renderEquityCurve(d) {
+  _lastD = d;
   const container = document.getElementById('equity-chart');
   const tooltip   = document.getElementById('equity-tooltip');
+  const initial   = d.initial;
+  const snapshots = d.equity_snapshots || [];
 
-  // Build series data — skip the null-timestamp anchor, keep the rest
-  const data = (points || [])
-    .filter(p => p.t)
-    .map(p => ({ time: Math.floor(new Date(p.t).getTime() / 1000), value: p.v }))
-    .filter(p => !isNaN(p.time))
-    // dedupe — lightweight-charts requires strictly ascending time
-    .filter((p, i, arr) => i === 0 || p.time > arr[i-1].time);
+  const ohlc = buildOHLC(snapshots, _candleInterval);
 
-  if (data.length < 2) {
-    container.innerHTML = '<div style="height:220px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px">No closed trades yet</div>';
+  if (ohlc.length < 2) {
+    if (_equityChart) { _equityChart.remove(); _equityChart = null; }
+    container.innerHTML = '<div style="height:260px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px">Waiting for data… (need 2 candles)</div>';
+    document.getElementById('curve-meta').textContent = '—';
     return;
   }
 
-  const isPos     = data[data.length - 1].value >= initial;
-  const lineColor = isPos ? '#22c55e' : '#f87171';
-  const topColor  = isPos ? 'rgba(34,197,94,0.25)'  : 'rgba(248,113,113,0.22)';
-  const botColor  = isPos ? 'rgba(34,197,94,0.02)'  : 'rgba(248,113,113,0.02)';
-
-  // Destroy previous chart instance on re-render
   if (_equityChart) { _equityChart.remove(); _equityChart = null; }
   container.innerHTML = '';
 
   const chart = LightweightCharts.createChart(container, {
     width:  container.clientWidth,
-    height: 220,
+    height: 260,
     layout: {
       background: { color: '#0d0f18' },
       textColor:  '#4a5068',
@@ -560,20 +687,14 @@ function renderEquityCurve(points, initial) {
     },
     crosshair: {
       mode: LightweightCharts.CrosshairMode.Normal,
-      vertLine: { color: 'rgba(200,169,110,0.6)', width: 1, style: LightweightCharts.LineStyle.Solid, labelBackgroundColor: '#1a1c28' },
-      horzLine: { color: 'rgba(200,169,110,0.6)', width: 1, style: LightweightCharts.LineStyle.Solid, labelBackgroundColor: '#1a1c28' },
+      vertLine: { color: 'rgba(200,169,110,0.5)', width: 1, style: LightweightCharts.LineStyle.Solid, labelBackgroundColor: '#1a1c28' },
+      horzLine: { color: 'rgba(200,169,110,0.5)', width: 1, style: LightweightCharts.LineStyle.Solid, labelBackgroundColor: '#1a1c28' },
     },
-    rightPriceScale: {
-      borderColor: 'rgba(255,255,255,0.06)',
-    },
+    rightPriceScale: { borderColor: 'rgba(255,255,255,0.06)' },
     timeScale: {
-      borderColor:     'rgba(255,255,255,0.06)',
-      timeVisible:     true,
-      secondsVisible:  false,
-      tickMarkFormatter: ts => {
-        const d = new Date(ts * 1000);
-        return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/Chicago' });
-      },
+      borderColor:    'rgba(255,255,255,0.06)',
+      timeVisible:    true,
+      secondsVisible: false,
     },
     localization: {
       priceFormatter: v => `$${v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
@@ -582,75 +703,76 @@ function renderEquityCurve(points, initial) {
     handleScale:  true,
   });
 
-  const series = chart.addAreaSeries({
-    lineColor, topColor, bottomColor: botColor,
-    lineWidth: 2,
+  const series = chart.addCandlestickSeries({
+    upColor:          '#22c55e',
+    downColor:        '#f87171',
+    borderUpColor:    '#22c55e',
+    borderDownColor:  '#f87171',
+    wickUpColor:      'rgba(34,197,94,0.65)',
+    wickDownColor:    'rgba(248,113,113,0.65)',
     priceLineVisible: false,
     lastValueVisible: true,
-    crosshairMarkerVisible: true,
-    crosshairMarkerRadius: 5,
-    crosshairMarkerBorderColor: lineColor,
-    crosshairMarkerBackgroundColor: '#0d0f18',
   });
+  series.setData(ohlc);
 
-  series.setData(data);
-
-  // Baseline — initial capital
   series.createPriceLine({
-    price:              initial,
-    color:              'rgba(200,169,110,0.45)',
-    lineWidth:          1,
-    lineStyle:          LightweightCharts.LineStyle.Dashed,
-    axisLabelVisible:   true,
-    title:              'start',
+    price: initial, color: 'rgba(200,169,110,0.5)',
+    lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed,
+    axisLabelVisible: true, title: 'start',
   });
 
-  chart.timeScale().fitContent();
+  const lastClose   = ohlc[ohlc.length - 1].close;
+  const total       = lastClose - initial;
+  const lbl         = _candleInterval < 60 ? `${_candleInterval}m` : _candleInterval < 1440 ? `${_candleInterval/60}h` : '1d';
+  document.getElementById('curve-meta').textContent =
+    `${ohlc.length} ${lbl} candles · ${fmt.pnl(total)} total`;
+
+  // Show ~35 candles; user can still scroll/zoom freely
+  const TARGET_BARS = 70;
+  const barSpacing  = Math.max(3, Math.floor((container.clientWidth - 60) / TARGET_BARS));
+  chart.timeScale().applyOptions({ barSpacing, minBarSpacing: 4 });
+  chart.timeScale().scrollToRealTime();
   _equityChart = chart;
 
-  // Resize observer
   new ResizeObserver(() => {
+    const bs = Math.max(3, Math.floor((container.clientWidth - 60) / TARGET_BARS));
     chart.applyOptions({ width: container.clientWidth });
+    chart.timeScale().applyOptions({ barSpacing: bs });
   }).observe(container);
 
-  // Hover tooltip
+  // Crosshair tooltip
   chart.subscribeCrosshairMove(param => {
     if (!param.time || !param.seriesData || !param.seriesData.has(series)) {
-      tooltip.style.display = 'none';
-      return;
+      tooltip.style.display = 'none'; return;
     }
-    const pt      = param.seriesData.get(series);
-    const value   = pt.value;
-    const change  = value - initial;
+    const c         = param.seriesData.get(series);
+    const value     = c.close;
+    const change    = value - initial;
     const changePct = (change / initial) * 100;
-    const ts      = new Date(param.time * 1000);
-    const timeStr = ts.toLocaleString('en-US', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'America/Chicago' });
-    const cc      = change >= 0 ? '#22c55e' : '#f87171';
-    const sign    = change >= 0 ? '+' : '';
-
-    document.getElementById('tt-value').textContent  = `$${value.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`;
-    document.getElementById('tt-change').innerHTML   = `<span style="color:${cc}">${sign}$${Math.abs(change).toFixed(2)} (${sign}${changePct.toFixed(2)}%)</span>`;
-    document.getElementById('tt-time').textContent   = timeStr;
-
-    // Keep tooltip inside the card
-    const rect = container.getBoundingClientRect();
-    const x    = param.point.x;
+    const candleChg = c.close - c.open;
+    const ts        = new Date(param.time * 1000);
+    const timeStr   = ts.toLocaleString('en-US', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'America/Chicago' });
+    const cc        = change >= 0 ? '#22c55e' : '#f87171';
+    const sign      = change >= 0 ? '+' : '';
+    const ccc       = candleChg >= 0 ? '#22c55e' : '#f87171';
+    const csign     = candleChg >= 0 ? '+' : '';
+    document.getElementById('tt-value').textContent = `$${value.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+    document.getElementById('tt-change').innerHTML  =
+      `<span style="color:${cc}">${sign}$${Math.abs(change).toFixed(2)} (${sign}${changePct.toFixed(2)}%)</span>` +
+      `<br><span style="color:${ccc};font-size:10px">candle ${csign}$${Math.abs(candleChg).toFixed(2)}</span>`;
+    document.getElementById('tt-time').textContent = timeStr;
+    const x = param.point.x;
     tooltip.style.left    = x > container.clientWidth / 2 ? 'auto' : '14px';
     tooltip.style.right   = x > container.clientWidth / 2 ? '14px' : 'auto';
     tooltip.style.display = 'block';
   });
-
-  // Hide tooltip on mouse leave
   container.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
-
-  // Curve summary
-  const total = data[data.length - 1].value - initial;
-  document.getElementById('curve-meta').textContent =
-    `${data.length} trades · ${fmt.pnl(total)} total`;
 }
 
 // ── Render helpers ────────────────────────────────────────────────────────────
 function renderStats(d) {
+  document.title = `$${d.equity.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0})}  ·  ∞`;
+
   set('s-equity', `$${d.equity.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`);
   set('s-initial', `started $${d.initial.toLocaleString('en-US',{minimumFractionDigits:0})}`);
 
@@ -674,7 +796,33 @@ function renderStats(d) {
   const expEl = document.getElementById('s-expectancy');
   expEl.textContent = fmt.pnl(d.performance.expectancy);
   expEl.className = 'stat-value ' + (d.performance.expectancy >= 0 ? 'pos' : 'neg');
-  set('s-avgwinloss', `${fmt.pnl(d.performance.avg_win)} / ${fmt.pnl(d.performance.avg_loss)}`);
+  const wSign = d.performance.avg_win  >= 0 ? '+' : '';
+  const lSign = d.performance.avg_loss >= 0 ? '+' : '';
+  const avgW  = `$${Math.abs(d.performance.avg_win).toFixed(2)}`;
+  const avgL  = `$${Math.abs(d.performance.avg_loss).toFixed(2)}`;
+  set('s-avgwinloss', d.performance.total_trades ? `avg W: +${avgW}  ·  avg L: -${avgL}` : 'no trades yet');
+
+  // Annualised return
+  const annEl = document.getElementById('s-annret');
+  if (d.days_live > 0 && d.ann_return_pct !== 0) {
+    annEl.textContent = fmt.pct(d.ann_return_pct);
+    annEl.className = 'stat-value ' + (d.ann_return_pct >= 0 ? 'pos' : 'neg');
+  } else {
+    annEl.textContent = '—';
+    annEl.className = 'stat-value';
+  }
+  set('s-dayslive', d.days_live > 0 ? `${d.days_live.toFixed(1)}d live` : 'no data yet');
+
+  // Sharpe ratio
+  const shEl = document.getElementById('s-sharpe');
+  if (d.sharpe !== 0) {
+    shEl.textContent = d.sharpe.toFixed(2);
+    shEl.className = 'stat-value ' + (d.sharpe >= 1 ? 'pos' : d.sharpe >= 0 ? 'gold' : 'neg');
+  } else {
+    shEl.textContent = '—';
+    shEl.className = 'stat-value';
+  }
+  set('s-sharpe-sub', d.sharpe !== 0 ? (d.sharpe >= 2 ? 'excellent' : d.sharpe >= 1 ? 'good' : d.sharpe >= 0 ? 'building' : 'negative') : 'need more trades');
 
   set('s-tick', `tick #${d.tick}`);
 
@@ -807,7 +955,7 @@ async function refresh(manual = false) {
     renderPositions(d.positions);
     renderRegime(d.regime, new Set(d.positions.map(p => p.name)));
     renderTrades(d.trades);
-    renderEquityCurve(d.equity_curve, d.initial);
+    renderEquityCurve(d);
 
     set('last-scan-label', `updated ${new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/Chicago'})} CT`);
     document.getElementById('stale-warn').style.display = 'none';
